@@ -6,8 +6,8 @@ Get this working end-to-end against live standings first, then layer the rest on
 """
 
 import streamlit as st
-from nhl.data import get_standings, compute_team_strengths, get_starting_goalie_stats
-from nhl.model import run_game_model, GoalieAdjustment
+from nhl_data import get_standings, compute_team_strengths, get_starting_goalie_stats
+from model import run_game_model, GoalieAdjustment
 
 st.set_page_config(page_title="NHL Model", layout="centered")
 st.title("NHL Game Model")
