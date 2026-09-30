@@ -97,6 +97,7 @@ def puck_line_probs(matrix: list[list[float]]) -> dict:
 
     return {
         "home_-1.5_raw": home_by_2plus,
+        "away_-1.5_raw": away_by_2plus,
         "away_+1.5_raw": away_by_2plus + away_by_1 + home_by_1 + tie,  # away covers unless home wins by 2+
         "home_by_1": home_by_1,
         "away_by_1": away_by_1,
@@ -116,24 +117,28 @@ def puck_line_probs_with_empty_net(matrix: list[list[float]]) -> dict:
     shifted_from_home_1 = raw["home_by_1"] * EMPTY_NET_1_GOAL_TO_2_GOAL_RATE
     shifted_from_away_1 = raw["away_by_1"] * EMPTY_NET_1_GOAL_TO_2_GOAL_RATE
 
-    home_covers = raw["home_-1.5_raw"] + shifted_from_home_1
-    away_covers = 1 - home_covers  # two-outcome market once you fold in the shift
+    home_minus = raw["home_-1.5_raw"] + shifted_from_home_1   # home wins by 2+
+    away_minus = raw["away_-1.5_raw"] + shifted_from_away_1   # away wins by 2+
 
+    # Each -1.5 / +1.5 pair is a two-outcome market, so the other side is the complement.
     return {
-        "home_-1.5": home_covers,
-        "away_+1.5": away_covers,
+        "home_-1.5": home_minus,
+        "away_+1.5": 1 - home_minus,
+        "away_-1.5": away_minus,
+        "home_+1.5": 1 - away_minus,
     }
 
 
 def totals_probs(matrix: list[list[float]], line: float) -> dict:
-    """P(over) / P(under) for a given total, e.g. line=6.0 for O/U 6."""
+    """Over / push / under for a total line. Push is non-zero only on whole-number lines."""
     over = sum(matrix[i][j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j > line)
-    under = 1 - over
-    return {"over": over, "under": under}
+    push = sum(matrix[i][j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j == line)
+    under = sum(matrix[i][j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j < line)
+    return {"over": over, "under": under, "push": push}
 
 
 def run_game_model(home_abbrev: str, away_abbrev: str, strengths: dict,
-                    total_line: float = 6.0,
+                    total_line: float = None,
                     home_goalie_adj: GoalieAdjustment = None,
                     away_goalie_adj: GoalieAdjustment = None) -> dict:
     """Single entry point — mirrors the MLB app's per-game model call."""
@@ -146,5 +151,5 @@ def run_game_model(home_abbrev: str, away_abbrev: str, strengths: dict,
         "moneyline": moneyline_probs(matrix, home_exp, away_exp),
         "puck_line_raw": puck_line_probs(matrix),
         "puck_line": puck_line_probs_with_empty_net(matrix),
-        "totals": totals_probs(matrix, total_line),
+        "totals": totals_probs(matrix, total_line) if total_line is not None else None,
     }
