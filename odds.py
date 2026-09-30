@@ -81,6 +81,13 @@ def best_prices(event: dict) -> dict:
     for bk in event.get("bookmakers", []):
         book = bk["title"]
         for mkt in bk.get("markets", []):
+            if mkt["key"] == "h2h":
+                # The model's ML includes OT/SO. Skip 3-way (home/draw/away) regulation markets,
+                # and any pair implying under 97% (a real 2-way market always carries a margin).
+                if any(o["name"].lower() == "draw" for o in mkt["outcomes"]):
+                    continue
+                if len(mkt["outcomes"]) == 2 and sum(1 / o["price"] for o in mkt["outcomes"]) < 0.97:
+                    continue
             for o in mkt["outcomes"]:
                 if mkt["key"] == "h2h":
                     side = "home" if o["name"] == home else "away" if o["name"] == away else None

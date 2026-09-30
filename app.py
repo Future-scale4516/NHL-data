@@ -1,8 +1,7 @@
 """
 app.py
-NHL slate view: model probabilities per game next to the best market price and edge.
-Slate + odds are fetched on button press, stored in session_state, and rendered outside
-the button so changing widgets afterwards doesn't wipe the display.
+NHL model vs market, one tab per market. Slate + odds are fetched on button press and stored
+in session_state, so changing the sort dropdown or switching tabs never wipes the display.
 """
 
 from datetime import date, datetime
@@ -10,6 +9,8 @@ import streamlit as st
 from nhl_data import get_standings, get_prior_standings, compute_team_strengths, get_games
 from model import run_game_model
 from odds import fetch_odds, match_event, best_prices
+
+EDGE_FLAG_PP = 8.0   # edges above this are more likely a model/data problem than real value
 
 st.set_page_config(page_title="NHL Model", layout="centered")
 st.title("NHL Game Model")
@@ -27,16 +28,88 @@ def cached_odds(api_key: str):
     return fetch_odds(api_key)
 
 
+def edge_pp(model_p, offer):
+    return (model_p - 1 / offer[0]) * 100 if offer else None
+
+
 def market_line(label, model_p, offer):
-    """One display row: model prob vs best price, implied prob, edge (pp) and EV."""
-    if not offer:
-        return f"{label}: model {model_p:.0%} | no price"
     price, book = offer
     implied = 1 / price
     edge = (model_p - implied) * 100
     ev = (model_p * price - 1) * 100
     row = f"{label}: model {model_p:.0%} | {price:.2f} ({book}) = {implied:.0%} | edge {edge:+.1f}pp | EV {ev:+.1f}%"
+    if edge > EDGE_FLAG_PP:
+        return f"**{row}** ⚠"
     return f"**{row}**" if edge > 0 else row
+
+
+def build_rows(g, market):
+    """(label, model_prob, best_offer) rows for one game in one market; [] if not priced."""
+    p = g["prices"]
+    if not p:
+        return []
+    r, h, a = g["result"], g["home"], g["away"]
+    ml, pl, tot = r["moneyline"], r["puck_line"], r["totals"]
+    if market == "Moneyline":
+        return [
+            (f"{h} ML", ml["home_win_prob"], p["h2h"]["home"]),
+            (f"{a} ML", ml["away_win_prob"], p["h2h"]["away"]),
+        ]
+    if market == "Puck line":
+        return [
+            (f"{h} -1.5", pl["home_-1.5"], p["spreads"]["home_-1.5"]),
+            (f"{a} +1.5", pl["away_+1.5"], p["spreads"]["away_+1.5"]),
+            (f"{a} -1.5", pl["away_-1.5"], p["spreads"]["away_-1.5"]),
+            (f"{h} +1.5", pl["home_+1.5"], p["spreads"]["home_+1.5"]),
+        ]
+    if market == "Totals" and tot and p["totals"]:
+        line = p["totals"]["line"]
+        decided = tot["over"] + tot["under"]          # condition on no push
+        return [
+            (f"Over {line:g}", tot["over"] / decided, p["totals"]["over"]),
+            (f"Under {line:g}", tot["under"] / decided, p["totals"]["under"]),
+        ]
+    return []
+
+
+def kickoff(g):
+    if not g["start_utc"]:
+        return ""
+    return datetime.fromisoformat(g["start_utc"].replace("Z", "+00:00")).strftime("%H:%M UTC")
+
+
+def render_market(market, slate):
+    sort_by = st.selectbox("Sort by", ["Best edge", "Kickoff"], key=f"sort_{market}")
+    entries, unpriced = [], []
+    for g in slate:
+        rows = [row for row in build_rows(g, market) if row[2]]   # only rows with a price
+        (entries if rows else unpriced).append((g, rows))
+
+    def best_edge(entry):
+        return max(edge_pp(m, o) for _, m, o in entry[1])
+
+    if sort_by == "Best edge":
+        entries.sort(key=best_edge, reverse=True)
+    else:
+        entries.sort(key=lambda e: e[0]["start_utc"] or "")
+
+    for g, rows in entries:
+        r = g["result"]
+        with st.container(border=True):
+            st.markdown(f"**{g['away']} @ {g['home']}**  ·  {kickoff(g)}")
+            if market == "Totals":
+                tot = r["totals"]
+                cap = f"model total xG {r['home_exp_goals'] + r['away_exp_goals']:.2f}"
+                if tot["push"] > 0.001:
+                    cap += f"  |  push {tot['push']:.0%} (excluded from Over/Under %)"
+                st.caption(cap)
+            else:
+                st.caption(f"xG {g['home']} {r['home_exp_goals']} - {r['away_exp_goals']} {g['away']}")
+            st.caption("  \n".join(market_line(*row) for row in rows))
+    for g, _ in unpriced:
+        st.caption(f"{g['away']} @ {g['home']}: no {market.lower()} prices posted yet")
+    if entries:
+        st.caption(f"⚠ = edge above {EDGE_FLAG_PP:g}pp. Treat as suspect (model or data), not as value.")
 
 
 day = st.date_input("Date", value=date.today())
@@ -74,35 +147,8 @@ slate = st.session_state.get("nhl_slate")
 if slate is not None:
     if not slate:
         st.info("No games found for that date.")
-    for g in slate:
-        r, p = g["result"], g["prices"]
-        h, a = g["home"], g["away"]
-        ml, pl, tot = r["moneyline"], r["puck_line"], r["totals"]
-        when = ""
-        if g["start_utc"]:
-            when = datetime.fromisoformat(g["start_utc"].replace("Z", "+00:00")).strftime("%H:%M UTC")
-        with st.container(border=True):
-            st.markdown(f"**{a} @ {h}**  ·  {when}")
-            st.caption(f"xG {h} {r['home_exp_goals']} - {r['away_exp_goals']} {a}")
-            if not p:
-                st.caption(
-                    f"No odds posted yet  |  ML {h} {ml['home_win_prob']:.0%} / {a} {ml['away_win_prob']:.0%}  |  "
-                    f"PL {h} -1.5 {pl['home_-1.5']:.0%} / {a} +1.5 {pl['away_+1.5']:.0%}"
-                )
-                continue
-            rows = [
-                market_line(f"ML {h}", ml["home_win_prob"], p["h2h"]["home"]),
-                market_line(f"ML {a}", ml["away_win_prob"], p["h2h"]["away"]),
-                market_line(f"{h} -1.5", pl["home_-1.5"], p["spreads"]["home_-1.5"]),
-                market_line(f"{a} +1.5", pl["away_+1.5"], p["spreads"]["away_+1.5"]),
-                market_line(f"{a} -1.5", pl["away_-1.5"], p["spreads"]["away_-1.5"]),
-                market_line(f"{h} +1.5", pl["home_+1.5"], p["spreads"]["home_+1.5"]),
-            ]
-            if tot and p["totals"]:
-                line = p["totals"]["line"]
-                decided = tot["over"] + tot["under"]          # condition on no push
-                rows.append(market_line(f"Over {line:g}", tot["over"] / decided, p["totals"]["over"]))
-                rows.append(market_line(f"Under {line:g}", tot["under"] / decided, p["totals"]["under"]))
-                if tot["push"] > 0.001:
-                    rows.append(f"(push on {line:g}: {tot['push']:.0%}, excluded from the Over/Under %)")
-            st.caption("  \n".join(rows))
+    else:
+        tabs = st.tabs(["Moneyline", "Puck line", "Totals"])
+        for tab, market in zip(tabs, ["Moneyline", "Puck line", "Totals"]):
+            with tab:
+                render_market(market, slate)
