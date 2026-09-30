@@ -9,6 +9,7 @@ the JSON — adjust the field lookups below if anything's renamed.
 """
 
 import requests
+from functools import lru_cache
 from datetime import date, timedelta
 
 NHL_API_BASE = "https://api-web.nhle.com/v1"
@@ -40,17 +41,43 @@ def get_standings(as_of_date: str = None) -> list[dict]:
     return teams
 
 
-PRIOR_SEASON_END = "2026-04-20"   # after last season's final game, before any new-season games
 PRIOR_WEIGHT_GAMES = 20           # last season's rates count as this many games of evidence
 PRIOR_REGRESSION = 0.25           # pull last season's rates 25% back toward league average
 
 
-def get_prior_standings() -> list[dict]:
-    """Last season's final standings, used as the early-season prior. Empty list on failure."""
+@lru_cache(maxsize=8)
+def prior_season_end_date(season_start_year: int) -> str:
+    """
+    Date of the final regular-season standings for the season BEFORE the one starting in
+    `season_start_year`. Read from the NHL API's own season list, because the standings
+    endpoint only answers sensibly for dates inside a season (a guessed off-season date
+    silently returns the wrong table).
+    """
     try:
-        return get_standings(PRIOR_SEASON_END)
+        resp = requests.get(f"{NHL_API_BASE}/standings-season", timeout=10)
+        resp.raise_for_status()
+        for s in resp.json().get("seasons", []):
+            if str(s.get("id", ""))[:4] == str(season_start_year - 1) and s.get("standingsEnd"):
+                return s["standingsEnd"]
+    except Exception:
+        pass
+    return f"{season_start_year}-04-14"   # fallback: safely inside the regular season
+
+
+def prior_is_valid(teams: list[dict]) -> bool:
+    """A real end-of-season table: every team at ~82 games. Anything else is the wrong table."""
+    return bool(teams) and sum(t["games_played"] for t in teams) / len(teams) >= 70
+
+
+def get_prior_standings(today: date = None) -> list[dict]:
+    """Last season's final standings, used as the early-season prior. [] if unavailable/invalid."""
+    d = today or date.today()
+    y = d.year if d.month >= 9 else d.year - 1      # start year of the current season
+    try:
+        teams = get_standings(prior_season_end_date(y))
     except Exception:
         return []
+    return teams if prior_is_valid(teams) else []
 
 
 def compute_team_strengths(teams: list[dict], prior_teams: list[dict] = None) -> dict:

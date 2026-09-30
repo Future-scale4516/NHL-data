@@ -12,7 +12,8 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 
 import model as nhl_model
-from nhl_data import get_standings, get_completed_games_range, compute_team_strengths
+from nhl_data import (get_standings, get_completed_games_range, compute_team_strengths,
+                      prior_season_end_date, prior_is_valid)
 from model import (expected_goals, score_matrix, moneyline_probs, puck_line_probs,
                    puck_line_probs_with_empty_net, totals_probs)
 from odds import match_event, best_prices
@@ -34,9 +35,13 @@ def season_start_year(d: date) -> int:
     return d.year if d.month >= 9 else d.year - 1
 
 
-def prior_season_end(d: date) -> str:
-    """A date after the previous season's final game, before any game of d's season."""
-    return f"{season_start_year(d)}-04-20"
+def prior_table(d: date) -> list[dict]:
+    """Previous season's final standings for the season containing d. Raises rather than degrade."""
+    teams = get_standings(prior_season_end_date(season_start_year(d)))
+    if not prior_is_valid(teams):
+        raise RuntimeError("Couldn't load last season's final standings (got a table that isn't a "
+                           "completed season), so early-season strengths would be wrong. Try again shortly.")
+    return teams
 
 
 def plausible_gp(d: date, teams: list[dict]) -> bool:
@@ -78,7 +83,7 @@ def outcome(g: dict) -> dict:
 # ---------- backtest ----------
 def build_game_frame(start: date, end: date, progress=None):
     """One row per completed game: model probabilities (point-in-time) + real outcomes."""
-    prior_teams = get_standings(prior_season_end(start))   # raise rather than silently use a flat prior
+    prior_teams = prior_table(start)
     games = get_completed_games_range(start, end)
     dates = sorted({g["date"] for g in games})
 
@@ -227,7 +232,7 @@ def selection_rows(g: dict, mdl: dict, prices=None, fixed_line=5.5) -> list[dict
 
 
 def _day_setup(day: date):
-    prior_teams = get_standings(prior_season_end(day))
+    prior_teams = prior_table(day)
     games = get_completed_games_range(day, day)
     if not games:
         return None, None, "No completed regular-season games found for that date."

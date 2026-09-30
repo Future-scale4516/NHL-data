@@ -122,7 +122,11 @@ if st.button("Load games"):
     with st.spinner("Loading slate and odds..."):
         try:
             teams = get_standings()
-            strengths = compute_team_strengths(teams, get_prior_standings())
+            prior = get_prior_standings()
+            if not prior:
+                st.warning("Last season's final standings couldn't be loaded, so team strengths are using "
+                           "this season's few games only. Treat every number below as unreliable.")
+            strengths = compute_team_strengths(teams, prior)
             games = get_games(day.isoformat())
             try:
                 events = cached_odds(api_key)
