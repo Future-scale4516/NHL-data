@@ -118,3 +118,23 @@ def best_prices(event: dict) -> dict:
             totals = {"line": line, "over": over, "under": under}
 
     return {"h2h": h2h, "spreads": spreads, "totals": totals}
+
+
+COST_LOG = []   # one entry per real (uncached) historical call; lets the UI report credits spent
+
+
+def fetch_historical_odds(api_key: str, iso_ts: str):
+    """
+    Odds snapshot as of iso_ts (YYYY-MM-DDTHH:MM:SSZ). Historical calls bill 10 credits per
+    region per market (3 markets x 1 region = 30). Returns (events, meta).
+    """
+    resp = requests.get(
+        f"{ODDS_API_BASE}/historical/sports/{SPORT_KEY}/odds",
+        params={"apiKey": api_key, "regions": REGIONS, "markets": MARKETS,
+                "oddsFormat": "decimal", "date": iso_ts},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    meta = {"last": int(resp.headers.get("x-requests-last", 0) or 0),
+            "remaining": resp.headers.get("x-requests-remaining")}
+    return resp.json().get("data", []), meta

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from scipy.stats import poisson
 
 HOME_ICE_GOAL_FACTOR = 1.06  # home teams score ~6% more than a neutral-site average; tune from backtests
+GOALS_SCALE = 1.0            # global multiplier on both teams' expected goals; fit from the backtest
 MAX_GOALS = 10               # truncate the scoring matrix here; NHL games essentially never exceed this
 EMPTY_NET_1_GOAL_TO_2_GOAL_RATE = 0.22  # share of 1-goal-margin regulation wins that become 2-goal via empty net
                                          # starting estimate — replace with your own backtested figure
@@ -45,8 +46,12 @@ def expected_goals(home_abbrev: str, away_abbrev: str, strengths: dict,
     home = strengths[home_abbrev]
     away = strengths[away_abbrev]
 
-    home_exp = league_avg * home["attack"] * away["defense"] * HOME_ICE_GOAL_FACTOR
-    away_exp = league_avg * away["attack"] * home["defense"]
+    # league_avg is already the average over home AND away teams, so split it around the mean:
+    # home/away keep the HOME_ICE_GOAL_FACTOR ratio but together still average to league_avg.
+    home_factor = 2 * HOME_ICE_GOAL_FACTOR / (1 + HOME_ICE_GOAL_FACTOR)
+    away_factor = 2 / (1 + HOME_ICE_GOAL_FACTOR)
+    home_exp = league_avg * home["attack"] * away["defense"] * home_factor
+    away_exp = league_avg * away["attack"] * home["defense"] * away_factor
 
     # Goalie adjustment acts on the OPPONENT's expected goals (a good away goalie suppresses home_exp)
     if away_goalie_adj:
@@ -54,7 +59,7 @@ def expected_goals(home_abbrev: str, away_abbrev: str, strengths: dict,
     if home_goalie_adj:
         away_exp *= home_goalie_adj.defense_multiplier()
 
-    return home_exp, away_exp
+    return home_exp * GOALS_SCALE, away_exp * GOALS_SCALE
 
 
 def score_matrix(home_exp: float, away_exp: float) -> list[list[float]]:

@@ -9,7 +9,7 @@ the JSON — adjust the field lookups below if anything's renamed.
 """
 
 import requests
-from datetime import date
+from datetime import date, timedelta
 
 NHL_API_BASE = "https://api-web.nhle.com/v1"
 
@@ -40,7 +40,7 @@ def get_standings(as_of_date: str = None) -> list[dict]:
     return teams
 
 
-PRIOR_SEASON_END = "2026-04-16"   # last regular-season day; confirm with debug_sample_standings
+PRIOR_SEASON_END = "2026-04-20"   # after last season's final game, before any new-season games
 PRIOR_WEIGHT_GAMES = 20           # last season's rates count as this many games of evidence
 PRIOR_REGRESSION = 0.25           # pull last season's rates 25% back toward league average
 
@@ -70,12 +70,17 @@ def compute_team_strengths(teams: list[dict], prior_teams: list[dict] = None) ->
     if cur_league and total_gp >= 200:               # enough current data, use it
         league_avg = cur_league
 
+    # Each season's rates are divided by THAT season's league average, so attack x defense
+    # averages to 1. (Mixing seasons inflates both factors whenever league scoring shifts.)
+    cur_norm = cur_league if (cur_league and total_gp >= 200) else league_avg
+    prior_norm = prior_league or league_avg
+
     prior = {}
     for t in (prior_teams or []):
         gp = t["games_played"]
         if gp:
-            a = (t["goals_for"] / gp) / league_avg
-            d = (t["goals_against"] / gp) / league_avg
+            a = (t["goals_for"] / gp) / prior_norm
+            d = (t["goals_against"] / gp) / prior_norm
             prior[t["team_abbrev"]] = (
                 1 + (a - 1) * (1 - PRIOR_REGRESSION),
                 1 + (d - 1) * (1 - PRIOR_REGRESSION),
@@ -86,8 +91,8 @@ def compute_team_strengths(teams: list[dict], prior_teams: list[dict] = None) ->
     for t in teams:
         gp = t["games_played"]
         p_att, p_def = prior.get(t["team_abbrev"], (1.0, 1.0))
-        cur_att = (t["goals_for"] / gp) / league_avg if gp else p_att
-        cur_def = (t["goals_against"] / gp) / league_avg if gp else p_def
+        cur_att = (t["goals_for"] / gp) / cur_norm if gp else p_att
+        cur_def = (t["goals_against"] / gp) / cur_norm if gp else p_def
         strengths[t["team_abbrev"]] = {
             "attack": (gp * cur_att + k * p_att) / (gp + k),
             "defense": (gp * cur_def + k * p_def) / (gp + k),
@@ -163,3 +168,46 @@ def debug_sample_goalie(team_abbrev: str, season: str):
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     print(resp.json().get("goalies", [])[:1])
+
+
+def get_completed_games_range(start: date, end: date) -> list[dict]:
+    """
+    Final REGULAR-SEASON games between start and end (inclusive) with scores.
+    Uses the schedule endpoint (returns a week at a time), so a season is ~30 calls.
+    last_period is REG / OT / SO -- needed because the shootout winner's final score
+    includes one extra goal that totals and goal-rate comparisons must exclude.
+    """
+    games, seen, d = [], set(), start
+    while d <= end:
+        resp = requests.get(f"{NHL_API_BASE}/schedule/{d.isoformat()}", timeout=15)
+        resp.raise_for_status()
+        max_day = d
+        for wk in resp.json().get("gameWeek", []):
+            try:
+                wd = date.fromisoformat(wk.get("date"))
+            except (TypeError, ValueError):
+                continue
+            max_day = max(max_day, wd)
+            if wd < start or wd > end:
+                continue
+            for g in wk.get("games", []):
+                if g.get("gameType") != 2 or g.get("gameState") not in ("OFF", "FINAL"):
+                    continue
+                h, a = g.get("homeTeam", {}), g.get("awayTeam", {})
+                if h.get("score") is None or a.get("score") is None or g["id"] in seen:
+                    continue
+                seen.add(g["id"])
+                games.append({
+                    "id": g["id"], "date": wd.isoformat(), "start_utc": g.get("startTimeUTC"),
+                    "home": h["abbrev"], "away": a["abbrev"],
+                    "home_score": h["score"], "away_score": a["score"],
+                    "last_period": (g.get("gameOutcome") or {}).get("lastPeriodType", "REG"),
+                })
+        d = max(max_day + timedelta(days=1), d + timedelta(days=1))
+    return games
+
+
+def debug_sample_completed(day: str):
+    """Run once: confirm score / gameOutcome fields match what get_completed_games_range expects."""
+    d = date.fromisoformat(day)
+    print(get_completed_games_range(d, d)[:2])
