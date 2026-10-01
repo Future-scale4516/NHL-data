@@ -8,11 +8,28 @@ against live data, call debug_sample_standings() / debug_sample_goalie() and eye
 the JSON — adjust the field lookups below if anything's renamed.
 """
 
+import time
 import requests
 from functools import lru_cache
 from datetime import date, timedelta
 
 NHL_API_BASE = "https://api-web.nhle.com/v1"
+
+
+def _get_json(url: str, timeout: int = 15, tries: int = 4):
+    """GET with exponential backoff -- long backtests make hundreds of calls and hit rate limits."""
+    last = None
+    for i in range(tries):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code == 429:
+                raise requests.HTTPError("429 Too Many Requests (rate limited)")
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            last = e
+            time.sleep(0.5 * 2 ** i)
+    raise last
 
 
 def get_standings(as_of_date: str = None) -> list[dict]:
@@ -21,10 +38,7 @@ def get_standings(as_of_date: str = None) -> list[dict]:
     as_of_date: 'YYYY-MM-DD', defaults to today.
     """
     d = as_of_date or date.today().isoformat()
-    url = f"{NHL_API_BASE}/standings/{d}"
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _get_json(f"{NHL_API_BASE}/standings/{d}")
 
     teams = []
     for row in data.get("standings", []):
@@ -43,6 +57,9 @@ def get_standings(as_of_date: str = None) -> list[dict]:
 
 PRIOR_WEIGHT_GAMES = 20           # last season's rates count as this many games of evidence
 PRIOR_REGRESSION = 0.25           # pull last season's rates 25% back toward league average
+STRENGTH_SHRINK = 1.0             # 1.0 = off. An extra flat shrink of attack/defense deviations. A 0.5 fit on
+                                  # Oct-Dec looked right but FAILED out-of-sample (late season it was already
+                                  # well calibrated), so prior weight (PRIOR_WEIGHT_GAMES) does this job instead.
 
 
 @lru_cache(maxsize=8)
@@ -80,7 +97,8 @@ def get_prior_standings(today: date = None) -> list[dict]:
     return teams if prior_is_valid(teams) else []
 
 
-def compute_team_strengths(teams: list[dict], prior_teams: list[dict] = None) -> dict:
+def compute_team_strengths(teams: list[dict], prior_teams: list[dict] = None,
+                           k: float = None, regression: float = None, shrink: float = None) -> dict:
     """
     Attack/defense multipliers vs league average, blended with last season's rates:
     blended = (gp * current + K * prior) / (gp + K)
@@ -102,6 +120,10 @@ def compute_team_strengths(teams: list[dict], prior_teams: list[dict] = None) ->
     cur_norm = cur_league if (cur_league and total_gp >= 200) else league_avg
     prior_norm = prior_league or league_avg
 
+    k = PRIOR_WEIGHT_GAMES if k is None else k                      # overrides let the Backtest page sweep these
+    regression = PRIOR_REGRESSION if regression is None else regression
+    shrink = STRENGTH_SHRINK if shrink is None else shrink
+
     prior = {}
     for t in (prior_teams or []):
         gp = t["games_played"]
@@ -109,11 +131,10 @@ def compute_team_strengths(teams: list[dict], prior_teams: list[dict] = None) ->
             a = (t["goals_for"] / gp) / prior_norm
             d = (t["goals_against"] / gp) / prior_norm
             prior[t["team_abbrev"]] = (
-                1 + (a - 1) * (1 - PRIOR_REGRESSION),
-                1 + (d - 1) * (1 - PRIOR_REGRESSION),
+                1 + (a - 1) * (1 - regression),
+                1 + (d - 1) * (1 - regression),
             )
 
-    k = PRIOR_WEIGHT_GAMES
     strengths = {}
     for t in teams:
         gp = t["games_played"]
@@ -121,8 +142,8 @@ def compute_team_strengths(teams: list[dict], prior_teams: list[dict] = None) ->
         cur_att = (t["goals_for"] / gp) / cur_norm if gp else p_att
         cur_def = (t["goals_against"] / gp) / cur_norm if gp else p_def
         strengths[t["team_abbrev"]] = {
-            "attack": (gp * cur_att + k * p_att) / (gp + k),
-            "defense": (gp * cur_def + k * p_def) / (gp + k),
+            "attack": 1 + shrink * ((gp * cur_att + k * p_att) / (gp + k) - 1),
+            "defense": 1 + shrink * ((gp * cur_def + k * p_def) / (gp + k) - 1),
             "games_played": gp,
         }
     strengths["_league_avg"] = league_avg
@@ -131,10 +152,9 @@ def compute_team_strengths(teams: list[dict], prior_teams: list[dict] = None) ->
 
 def get_games(day: str) -> list[dict]:
     """Games scheduled on a given date (YYYY-MM-DD), as listed by the NHL schedule endpoint."""
-    resp = requests.get(f"{NHL_API_BASE}/schedule/{day}", timeout=10)
-    resp.raise_for_status()
+    payload = _get_json(f"{NHL_API_BASE}/schedule/{day}")
     games = []
-    for wk in resp.json().get("gameWeek", []):
+    for wk in payload.get("gameWeek", []):
         if wk.get("date") != day:
             continue
         for g in wk.get("games", []):
@@ -206,10 +226,9 @@ def get_completed_games_range(start: date, end: date) -> list[dict]:
     """
     games, seen, d = [], set(), start
     while d <= end:
-        resp = requests.get(f"{NHL_API_BASE}/schedule/{d.isoformat()}", timeout=15)
-        resp.raise_for_status()
+        payload = _get_json(f"{NHL_API_BASE}/schedule/{d.isoformat()}")
         max_day = d
-        for wk in resp.json().get("gameWeek", []):
+        for wk in payload.get("gameWeek", []):
             try:
                 wd = date.fromisoformat(wk.get("date"))
             except (TypeError, ValueError):

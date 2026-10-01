@@ -15,8 +15,9 @@ from scipy.stats import poisson
 HOME_ICE_GOAL_FACTOR = 1.06  # home teams score ~6% more than a neutral-site average; tune from backtests
 GOALS_SCALE = 1.0            # global multiplier on both teams' expected goals; fit from the backtest
 MAX_GOALS = 10               # truncate the scoring matrix here; NHL games essentially never exceed this
-EMPTY_NET_1_GOAL_TO_2_GOAL_RATE = 0.22  # share of 1-goal-margin regulation wins that become 2-goal via empty net
-                                         # starting estimate — replace with your own backtested figure
+EMPTY_NET_1_GOAL_TO_2_GOAL_RATE = 0.10  # uncertain: Oct-Dec implied -0.02 +/-0.10, Mar-Apr implied 0.25 +/-0.15,
+                                         # pooled ~0.06 +/-0.08. Brier barely moves across 0-0.22, so don't over-tune;
+                                         # revisit once a full clean season is scored.
 
 
 @dataclass

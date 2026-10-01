@@ -2,7 +2,7 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 from datetime import date
-from nhl_backtest import build_game_frame, calibration, tuning_diagnostics, MARKETS
+from nhl_backtest import build_game_frame, calibration, tuning_diagnostics, sweep_settings, MARKETS
 
 st.set_page_config(page_title="NHL Model - Backtest", layout="centered")
 st.title("📊 NHL Model Backtest")
@@ -52,19 +52,22 @@ if st.button("Run backtest"):
     else:
         bar = st.progress(0.0, text="Fetching results and point-in-time standings...")
         try:
-            df, notes = build_game_frame(start, end, progress=lambda f: bar.progress(min(f, 1.0)))
-            st.session_state["nhl_bt"] = (df, notes, str(start), str(end))
+            df, notes, ctx = build_game_frame(start, end, progress=lambda f: bar.progress(min(f, 1.0)))
+            st.session_state["nhl_bt"] = (df, notes, str(start), str(end), ctx)
+            st.session_state.pop("nhl_sweep", None)
         except Exception as e:
             st.error(f"Backtest failed: {e}")
         bar.empty()
 
 res = st.session_state.get("nhl_bt")
 if res:
-    df, notes, s, e = res
+    df, notes, s, e, ctx = res
     if df.empty:
         st.warning("No completed games found in that window.")
     else:
-        st.caption(f"Scored {len(df)} games between {s} and {e}. " + " ".join(notes))
+        st.caption(f"Window {s} to {e}.")
+        for n in notes:
+            (st.warning if n.startswith("⚠") else st.caption)(n)
         if len(df) < 300:
             st.info(f"Only {len(df)} games - calibration bands will be noisy. Widen the window before "
                     "changing any model constant.")
@@ -74,6 +77,22 @@ if res:
                    "then re-run on a different one (e.g. Oct-Dec, then Jan-Apr) to confirm the change "
                    "holds up rather than just fitting this sample.")
         st.dataframe(tuning_diagnostics(df), width="stretch", hide_index=True)
+
+        st.markdown("## 🎛️ Tune team-strength settings")
+        st.caption("Re-scores the same games under different settings for how much weight last season's ratings "
+                   "get (PRIOR_WEIGHT_GAMES: higher = trust current form more slowly) and how far they're pulled "
+                   "toward average (PRIOR_REGRESSION). No API calls. Values are Brier vs the always-predict-the-base-"
+                   "rate forecast, so **negative = beats naive, lower = better**. Prefer a setting that is good in "
+                   "BOTH halves of the window, not just the best average: one window alone has misled us before.")
+        if st.button("Run settings sweep"):
+            bar2 = st.progress(0.0, text="Re-scoring games under each setting...")
+            st.session_state["nhl_sweep"] = sweep_settings(ctx, progress=lambda f: bar2.progress(min(f, 1.0)))
+            bar2.empty()
+        sw = st.session_state.get("nhl_sweep")
+        if sw is not None and not sw.empty:
+            st.dataframe(sw.round(4), width="stretch", hide_index=True)
+            st.caption("To apply a setting, edit PRIOR_WEIGHT_GAMES / PRIOR_REGRESSION at the top of nhl_data.py. "
+                       "Differences under ~0.001 are noise on a window this size.")
 
         st.markdown("## Calibration by market")
         for name, (p_col, y_col) in MARKETS.items():

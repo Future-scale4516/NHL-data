@@ -6,12 +6,14 @@ No lookahead: each game is modelled with standings as of the DAY BEFORE it was p
 blended with the prior season exactly as the live app does.
 """
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 
 import pandas as pd
 
 import model as nhl_model
+import nhl_data
 from nhl_data import (get_standings, get_completed_games_range, compute_team_strengths,
                       prior_season_end_date, prior_is_valid)
 from model import (expected_goals, score_matrix, moneyline_probs, puck_line_probs,
@@ -81,37 +83,26 @@ def outcome(g: dict) -> dict:
 
 
 # ---------- backtest ----------
-def build_game_frame(start: date, end: date, progress=None):
-    """One row per completed game: model probabilities (point-in-time) + real outcomes."""
-    prior_teams = prior_table(start)
-    games = get_completed_games_range(start, end)
-    dates = sorted({g["date"] for g in games})
+def _fetch_asof(d_iso: str):
+    """Standings as of the day before d_iso. Returns (teams, error_text)."""
+    asof = (date.fromisoformat(d_iso) - timedelta(days=1)).isoformat()
+    try:
+        return get_standings(asof), None
+    except Exception as e:                       # get_standings already retried with backoff
+        return None, f"{type(e).__name__}: {e}"
 
-    def fetch(d_iso):
-        asof = (date.fromisoformat(d_iso) - timedelta(days=1)).isoformat()
-        for _ in range(2):
-            try:
-                return d_iso, get_standings(asof)
-            except Exception:
-                pass
-        return d_iso, None
 
-    standings = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        for i, (d_iso, teams) in enumerate(ex.map(fetch, dates)):
-            standings[d_iso] = teams
-            if progress:
-                progress((i + 1) / max(len(dates), 1))
-
-    strengths_by_date, skipped, rows = {}, set(), []
+def _frame(games, standings, prior_teams, **params):
+    """Model + outcome rows for every game that has usable point-in-time standings."""
+    strengths_by_date, guard_skipped, rows = {}, set(), []
     for g in games:
         d_iso = g["date"]
         if d_iso not in strengths_by_date:
             teams = standings.get(d_iso)
             ok = bool(teams) and plausible_gp(date.fromisoformat(d_iso), teams)
-            strengths_by_date[d_iso] = compute_team_strengths(teams, prior_teams) if ok else None
-            if not ok:
-                skipped.add(d_iso)
+            strengths_by_date[d_iso] = compute_team_strengths(teams, prior_teams, **params) if ok else None
+            if teams and not ok:
+                guard_skipped.add(d_iso)
         strengths = strengths_by_date[d_iso]
         if not strengths or g["home"] not in strengths or g["away"] not in strengths:
             continue
@@ -129,11 +120,94 @@ def build_game_frame(start: date, end: date, progress=None):
             "over55_p": totals_probs(m, 5.5)["over"], "over55": o["total_goals"] > 5.5,
             "over65_p": totals_probs(m, 6.5)["over"], "over65": o["total_goals"] > 6.5,
         })
-    notes = []
-    if skipped:
-        notes.append(f"Skipped {len(skipped)} date(s) where point-in-time standings were unavailable "
-                     "or looked like a previous season's table.")
-    return pd.DataFrame(rows), notes
+    return pd.DataFrame(rows), guard_skipped
+
+
+def build_game_frame(start: date, end: date, progress=None):
+    """
+    One row per completed game: model probabilities (point-in-time) + real outcomes.
+    Returns (df, notes, ctx). ctx holds the fetched data so the settings sweep can re-score
+    the same games without touching the API again.
+    """
+    prior_teams = prior_table(start)
+    games = get_completed_games_range(start, end)
+    dates = sorted({g["date"] for g in games})
+
+    # Pass 1: modest parallelism (8 workers tripped the API's rate limit on a full season)
+    standings, errors = {}, {}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for i, (d_iso, (teams, err)) in enumerate(zip(dates, ex.map(_fetch_asof, dates))):
+            standings[d_iso] = teams
+            if err:
+                errors[d_iso] = err
+            if progress:
+                progress(0.8 * (i + 1) / max(len(dates), 1))
+    # Pass 2: retry whatever failed, one at a time, after a pause
+    failed = [d for d in dates if standings.get(d) is None]
+    if failed:
+        time.sleep(2)
+        for i, d_iso in enumerate(failed):
+            teams, err = _fetch_asof(d_iso)
+            standings[d_iso] = teams
+            if err:
+                errors[d_iso] = err
+            else:
+                errors.pop(d_iso, None)
+            if progress:
+                progress(0.8 + 0.2 * (i + 1) / len(failed))
+
+    df, guard_skipped = _frame(games, standings, prior_teams)
+    notes = [f"Fetched {len(games)} completed games over {len(dates)} dates; scored {len(df)}."]
+    still_failed = sorted(d for d in dates if standings.get(d) is None)
+    if still_failed:
+        sample = errors.get(still_failed[0], "unknown error")
+        lost = sum(1 for g in games if g["date"] in still_failed)
+        notes.append(f"⚠ {len(still_failed)} date(s) ({lost} games) could not be fetched even after retries, so "
+                     f"they are MISSING from this backtest (first: {still_failed[0]}; last: {still_failed[-1]}). "
+                     f"Error: {sample[:160]}. Re-run before trusting these numbers.")
+    if guard_skipped:
+        notes.append(f"Skipped {len(guard_skipped)} date(s) where the standings looked like a previous "
+                     "season's table (too early in the season).")
+    ctx = {"games": games, "standings": standings, "prior": prior_teams}
+    return df, notes, ctx
+
+
+def summarize_settings(df: pd.DataFrame) -> dict:
+    """Brier vs naive per market (negative = beats always-predicting-the-base-rate), plus the slope."""
+    def delta(p_col, y_col):
+        p, y = df[p_col].astype(float), df[y_col].astype(float)
+        return ((p - y) ** 2).mean() - y.mean() * (1 - y.mean())
+    d = {name: delta(*cols) for name, cols in MARKETS.items()}
+    xd, ad = df["home_xg"] - df["away_xg"], df["home_goals"] - df["away_goals"]
+    days = sorted(df["date"].unique())
+    mid = days[len(days) // 2]                      # split by calendar, so both halves span many dates
+    halves = [h for h in (df[df["date"] < mid], df[df["date"] >= mid]) if len(h)]
+    half_avg = [sum(((h[p].astype(float) - h[y].astype(float)) ** 2).mean() - h[y].mean() * (1 - h[y].mean())
+                    for p, y in MARKETS.values()) / len(MARKETS) for h in halves]
+    return {"ML": d["Moneyline (home win)"],
+            "Puck": (d["Puck line (home -1.5)"] + d["Puck line (away -1.5)"]) / 2,
+            "Totals": (d["Total Over 5.5"] + d["Total Over 6.5"]) / 2,
+            "Avg": sum(d.values()) / len(d), "Slope": xd.cov(ad) / xd.var(),
+            "1st half": half_avg[0] if half_avg else float("nan"),
+            "2nd half": half_avg[1] if len(half_avg) > 1 else float("nan")}
+
+
+def sweep_settings(ctx: dict, ks=(20, 40, 70, 100), regressions=(0.25, 0.5), progress=None) -> pd.DataFrame:
+    """Re-score the SAME fetched games under different prior-weight / regression settings."""
+    combos = [(k, r) for k in ks for r in regressions]
+    cur = (nhl_data.PRIOR_WEIGHT_GAMES, nhl_data.PRIOR_REGRESSION)
+    if cur not in combos:
+        combos.append(cur)
+    rows = []
+    for n, (k, r) in enumerate(combos):
+        df, _ = _frame(ctx["games"], ctx["standings"], ctx["prior"], k=k, regression=r)
+        if df.empty:
+            continue
+        rows.append({"PRIOR_WEIGHT_GAMES": k, "PRIOR_REGRESSION": r,
+                     "current?": "<- current" if (k, r) == cur else "", **summarize_settings(df)})
+        if progress:
+            progress((n + 1) / len(combos))
+    return pd.DataFrame(rows).sort_values("Avg").reset_index(drop=True)
 
 
 def calibration(df: pd.DataFrame, p_col: str, y_col: str):
@@ -169,6 +243,11 @@ def tuning_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
          f"{nhl_model.HOME_ICE_GOAL_FACTOR * (ah / aa) / (mh / ma):.3f}"),
         ("Home win % (incl. OT/SO)", f"{df['ml_home_p'].mean() * 100:.1f}%", f"{df['home_win'].mean() * 100:.1f}%", ""),
     ]
+    xd, ad = df["home_xg"] - df["away_xg"], df["home_goals"] - df["away_goals"]
+    slope = xd.cov(ad) / xd.var()
+    rows.append(("Goal-diff slope (1.0 = team spread right)", "1.00", f"{slope:.2f}",
+                 f"STRENGTH_SHRINK {nhl_data.STRENGTH_SHRINK:.2f} -> {nhl_data.STRENGTH_SHRINK * slope:.2f}"
+                 "  (noisy: expect +/-0.35 on ~650 games)"))
     by1 = (df["home_by_1"] + df["away_by_1"]).sum()
     if by1:
         actual_2 = df["home_m15"].sum() + df["away_m15"].sum()
