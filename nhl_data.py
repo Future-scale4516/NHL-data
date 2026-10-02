@@ -32,13 +32,13 @@ def _get_json(url: str, timeout: int = 15, tries: int = 4):
     raise last
 
 
-def get_standings(as_of_date: str = None) -> list[dict]:
+def get_standings(as_of_date: str = None, tries: int = 4) -> list[dict]:
     """
     Returns one dict per team with season-to-date goals for/against and games played.
     as_of_date: 'YYYY-MM-DD', defaults to today.
     """
     d = as_of_date or date.today().isoformat()
-    data = _get_json(f"{NHL_API_BASE}/standings/{d}")
+    data = _get_json(f"{NHL_API_BASE}/standings/{d}", tries=tries)
 
     teams = []
     for row in data.get("standings", []):
@@ -55,8 +55,10 @@ def get_standings(as_of_date: str = None) -> list[dict]:
     return teams
 
 
-PRIOR_WEIGHT_GAMES = 20           # last season's rates count as this many games of evidence
-PRIOR_REGRESSION = 0.25           # pull last season's rates 25% back toward league average
+PRIOR_WEIGHT_GAMES = 70           # last season's rates count as this many games of evidence. Fitted on the full
+                                  # 2025-26 season (1,192 games): at 20 the team spread was overconfident (slope 0.70,
+                                  # 95% CI 0.44-0.95); 70 brings it to ~0.93. Sweep rows were within noise of each other.
+PRIOR_REGRESSION = 0.5            # pull last season's rates 50% back toward average (beat 0.25 at every K in the sweep)
 STRENGTH_SHRINK = 1.0             # 1.0 = off. An extra flat shrink of attack/defense deviations. A 0.5 fit on
                                   # Oct-Dec looked right but FAILED out-of-sample (late season it was already
                                   # well calibrated), so prior weight (PRIOR_WEIGHT_GAMES) does this job instead.
@@ -257,3 +259,17 @@ def debug_sample_completed(day: str):
     """Run once: confirm score / gameOutcome fields match what get_completed_games_range expects."""
     d = date.fromisoformat(day)
     print(get_completed_games_range(d, d)[:2])
+
+
+def get_boxscore(game_id: int, tries: int = 4) -> dict:
+    """Full boxscore for one game (player stats per team, incl. goalies)."""
+    return _get_json(f"{NHL_API_BASE}/gamecenter/{game_id}/boxscore", tries=tries)
+
+
+def debug_sample_boxscore(game_id: int):
+    """Run once: confirm the goalie fields (starter, toi, shotsAgainst, saves) match nhl_goalies.parse_goalies."""
+    box = get_boxscore(game_id)
+    print("top-level keys:", list(box.keys()))
+    pbs = box.get("playerByGameStats", {})
+    print("playerByGameStats keys:", list(pbs.keys()))
+    print("goalies sample:", (pbs.get("homeTeam", {}).get("goalies") or [])[:2])

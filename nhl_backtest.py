@@ -56,8 +56,10 @@ def plausible_gp(d: date, teams: list[dict]) -> bool:
     return max_gp <= (d - season_start).days + 3
 
 
-def compute_model(home: str, away: str, strengths: dict) -> dict:
+def compute_model(home: str, away: str, strengths: dict, xg_mult=(1.0, 1.0)) -> dict:
+    """xg_mult scales (home, away) expected goals, e.g. for the opposing goalie's quality."""
     hx, ax = expected_goals(home, away, strengths)
+    hx, ax = hx * xg_mult[0], ax * xg_mult[1]
     m = score_matrix(hx, ax)
     ml = moneyline_probs(m, hx, ax)
     raw = puck_line_probs(m)
@@ -83,17 +85,28 @@ def outcome(g: dict) -> dict:
 
 
 # ---------- backtest ----------
-def _fetch_asof(d_iso: str):
+_STANDINGS_CACHE = {}   # as-of date -> teams. Past standings never change, so a re-run only refetches failures.
+
+
+def _fetch_asof(d_iso: str, tries: int = 4):
     """Standings as of the day before d_iso. Returns (teams, error_text)."""
     asof = (date.fromisoformat(d_iso) - timedelta(days=1)).isoformat()
+    if asof in _STANDINGS_CACHE:
+        return _STANDINGS_CACHE[asof], None
     try:
-        return get_standings(asof), None
-    except Exception as e:                       # get_standings already retried with backoff
+        teams = get_standings(asof, tries=tries)
+    except Exception as e:
         return None, f"{type(e).__name__}: {e}"
+    if teams and date.fromisoformat(asof) < date.today() - timedelta(days=3):
+        _STANDINGS_CACHE[asof] = teams
+    return teams, None
 
 
-def _frame(games, standings, prior_teams, **params):
-    """Model + outcome rows for every game that has usable point-in-time standings."""
+def _frame(games, standings, prior_teams, goalie_mults=None, **params):
+    """
+    Model + outcome rows for every game that has usable point-in-time standings.
+    goalie_mults: optional {game_id: (home_xg_mult, away_xg_mult)}; missing games get no adjustment.
+    """
     strengths_by_date, guard_skipped, rows = {}, set(), []
     for g in games:
         d_iso = g["date"]
@@ -106,10 +119,11 @@ def _frame(games, standings, prior_teams, **params):
         strengths = strengths_by_date[d_iso]
         if not strengths or g["home"] not in strengths or g["away"] not in strengths:
             continue
-        mdl, o = compute_model(g["home"], g["away"], strengths), outcome(g)
+        mult = (goalie_mults or {}).get(g["id"], (1.0, 1.0))
+        mdl, o = compute_model(g["home"], g["away"], strengths, xg_mult=mult), outcome(g)
         pl, m = mdl["pl"], mdl["matrix"]
         rows.append({
-            "date": d_iso, "home": g["home"], "away": g["away"],
+            "game_id": g["id"], "date": d_iso, "home": g["home"], "away": g["away"],
             "home_xg": mdl["home_xg"], "away_xg": mdl["away_xg"],
             "home_goals": o["home_goals"], "away_goals": o["away_goals"],
             "ml_home_p": mdl["ml_home_p"], "home_win": o["margin"] > 0,
@@ -139,9 +153,11 @@ def fetch_standings_for(dates, progress=None):
                 progress(0.8 * (i + 1) / max(len(dates), 1))
     failed = [d for d in dates if standings.get(d) is None]
     if failed:
-        time.sleep(2)
+        time.sleep(3)
         for i, d_iso in enumerate(failed):
-            teams, err = _fetch_asof(d_iso)
+            if i:
+                time.sleep(3)                     # one at a time, slowly: the limit is per-burst
+            teams, err = _fetch_asof(d_iso, tries=6)
             standings[d_iso] = teams
             if err:
                 errors[d_iso] = err
@@ -171,7 +187,7 @@ def build_game_frame(start: date, end: date, progress=None):
         lost = sum(1 for g in games if g["date"] in still_failed)
         notes.append(f"⚠ {len(still_failed)} date(s) ({lost} games) could not be fetched even after retries, so "
                      f"they are MISSING from this backtest (first: {still_failed[0]}; last: {still_failed[-1]}). "
-                     f"Error: {sample[:160]}. Re-run before trusting these numbers.")
+                     f"Error: {sample[:160]}. Click Run backtest again: dates already fetched are remembered, so it only retries these.")
     if guard_skipped:
         notes.append(f"Skipped {len(guard_skipped)} date(s) where the standings looked like a previous "
                      "season's table (too early in the season).")
