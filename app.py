@@ -79,7 +79,7 @@ def kickoff(g):
 
 
 def render_market(market, slate):
-    sort_by = st.selectbox("Sort by", ["Best edge", "Kickoff"], key=f"sort_{market}")
+    sort_by = st.selectbox("Sort by", ["Best edge", "Model %", "Kickoff"], key=f"sort_{market}")
     entries, unpriced = [], []
     for g in slate:
         rows = [row for row in build_rows(g, market) if row[2]]   # only rows with a price
@@ -88,8 +88,13 @@ def render_market(market, slate):
     def best_edge(entry):
         return max(edge_pp(m, o) for _, m, o in entry[1])
 
+    def best_model(entry):
+        return max(m for _, m, _ in entry[1])      # the model's most confident side in this market
+
     if sort_by == "Best edge":
         entries.sort(key=best_edge, reverse=True)
+    elif sort_by == "Model %":
+        entries.sort(key=best_model, reverse=True)
     else:
         entries.sort(key=lambda e: e[0]["start_utc"] or "")
 

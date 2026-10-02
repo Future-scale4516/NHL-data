@@ -123,17 +123,12 @@ def _frame(games, standings, prior_teams, **params):
     return pd.DataFrame(rows), guard_skipped
 
 
-def build_game_frame(start: date, end: date, progress=None):
+def fetch_standings_for(dates, progress=None):
     """
-    One row per completed game: model probabilities (point-in-time) + real outcomes.
-    Returns (df, notes, ctx). ctx holds the fetched data so the settings sweep can re-score
-    the same games without touching the API again.
+    Point-in-time standings for each date. Pass 1: modest parallelism (8 workers tripped the API's rate
+    limit on a full season). Pass 2: retry whatever failed, one at a time, after a pause.
+    Returns (standings by date, error text by date, sorted list of dates that still failed).
     """
-    prior_teams = prior_table(start)
-    games = get_completed_games_range(start, end)
-    dates = sorted({g["date"] for g in games})
-
-    # Pass 1: modest parallelism (8 workers tripped the API's rate limit on a full season)
     standings, errors = {}, {}
     with ThreadPoolExecutor(max_workers=4) as ex:
         for i, (d_iso, (teams, err)) in enumerate(zip(dates, ex.map(_fetch_asof, dates))):
@@ -142,7 +137,6 @@ def build_game_frame(start: date, end: date, progress=None):
                 errors[d_iso] = err
             if progress:
                 progress(0.8 * (i + 1) / max(len(dates), 1))
-    # Pass 2: retry whatever failed, one at a time, after a pause
     failed = [d for d in dates if standings.get(d) is None]
     if failed:
         time.sleep(2)
@@ -155,10 +149,23 @@ def build_game_frame(start: date, end: date, progress=None):
                 errors.pop(d_iso, None)
             if progress:
                 progress(0.8 + 0.2 * (i + 1) / len(failed))
+    return standings, errors, sorted(d for d in dates if standings.get(d) is None)
+
+
+def build_game_frame(start: date, end: date, progress=None):
+    """
+    One row per completed game: model probabilities (point-in-time) + real outcomes.
+    Returns (df, notes, ctx). ctx holds the fetched data so the settings sweep can re-score
+    the same games without touching the API again.
+    """
+    prior_teams = prior_table(start)
+    games = get_completed_games_range(start, end)
+    dates = sorted({g["date"] for g in games})
+
+    standings, errors, still_failed = fetch_standings_for(dates, progress)
 
     df, guard_skipped = _frame(games, standings, prior_teams)
     notes = [f"Fetched {len(games)} completed games over {len(dates)} dates; scored {len(df)}."]
-    still_failed = sorted(d for d in dates if standings.get(d) is None)
     if still_failed:
         sample = errors.get(still_failed[0], "unknown error")
         lost = sum(1 for g in games if g["date"] in still_failed)
@@ -277,13 +284,14 @@ def selection_rows(g: dict, mdl: dict, prices=None, fixed_line=5.5) -> list[dict
         return prices[mkt][key] if mkt != "totals" else (prices["totals"] or {}).get(key)
 
     p_home = mdl["ml_home_p"]
+    # (market, label, line, model prob, hit, push, best offer, key) -- key matches odds.fair_probs
     sels = [
-        ("Moneyline", f"{h} ML", "", p_home, margin > 0, False, offer("h2h", "home")),
-        ("Moneyline", f"{a} ML", "", 1 - p_home, margin < 0, False, offer("h2h", "away")),
-        ("Puck line", f"{h} -1.5", -1.5, pl["home_-1.5"], margin >= 2, False, offer("spreads", "home_-1.5")),
-        ("Puck line", f"{a} +1.5", 1.5, pl["away_+1.5"], margin < 2, False, offer("spreads", "away_+1.5")),
-        ("Puck line", f"{a} -1.5", -1.5, pl["away_-1.5"], margin <= -2, False, offer("spreads", "away_-1.5")),
-        ("Puck line", f"{h} +1.5", 1.5, pl["home_+1.5"], margin > -2, False, offer("spreads", "home_+1.5")),
+        ("Moneyline", f"{h} ML", "", p_home, margin > 0, False, offer("h2h", "home"), "h2h:home"),
+        ("Moneyline", f"{a} ML", "", 1 - p_home, margin < 0, False, offer("h2h", "away"), "h2h:away"),
+        ("Puck line", f"{h} -1.5", -1.5, pl["home_-1.5"], margin >= 2, False, offer("spreads", "home_-1.5"), "spreads:home_-1.5"),
+        ("Puck line", f"{a} +1.5", 1.5, pl["away_+1.5"], margin < 2, False, offer("spreads", "away_+1.5"), "spreads:away_+1.5"),
+        ("Puck line", f"{a} -1.5", -1.5, pl["away_-1.5"], margin <= -2, False, offer("spreads", "away_-1.5"), "spreads:away_-1.5"),
+        ("Puck line", f"{h} +1.5", 1.5, pl["home_+1.5"], margin > -2, False, offer("spreads", "home_+1.5"), "spreads:home_+1.5"),
     ]
     line = fixed_line if prices is None else (prices["totals"]["line"] if prices and prices["totals"] else None)
     if line is not None:
@@ -291,12 +299,12 @@ def selection_rows(g: dict, mdl: dict, prices=None, fixed_line=5.5) -> list[dict
         decided = t["over"] + t["under"]          # condition on no push
         push = tot == line
         sels += [
-            ("Total", f"Over {line:g}", line, t["over"] / decided, tot > line, push, offer("totals", "over")),
-            ("Total", f"Under {line:g}", line, t["under"] / decided, tot < line, push, offer("totals", "under")),
+            ("Total", f"Over {line:g}", line, t["over"] / decided, tot > line, push, offer("totals", "over"), "totals:over"),
+            ("Total", f"Under {line:g}", line, t["under"] / decided, tot < line, push, offer("totals", "under"), "totals:under"),
         ]
 
     rows = []
-    for market, label, ln, p, hit, push, off in sels:
+    for market, label, ln, p, hit, push, off, key in sels:
         row = {"Market": market, "Selection": label, "Line": ln, "Model %": round(p * 100, 1),
                "Hit": bool(hit) and not push, "Push": bool(push), "Game": f"{a} @ {h}", "Score": score}
         if prices is not None:
@@ -305,7 +313,8 @@ def selection_rows(g: dict, mdl: dict, prices=None, fixed_line=5.5) -> list[dict
             price, book = off
             row.update({"Odds": price, "Book": book, "Implied %": round(100 / price, 1),
                         "Edge (pp)": round(p * 100 - 100 / price, 1),
-                        "P/L (1u)": 0.0 if push else (round(price - 1, 2) if hit else -1.0)})
+                        "P/L (1u)": 0.0 if push else (round(price - 1, 2) if hit else -1.0),
+                        "Key": key})
         rows.append(row)
     return rows
 

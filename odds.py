@@ -138,3 +138,47 @@ def fetch_historical_odds(api_key: str, iso_ts: str):
     meta = {"last": int(resp.headers.get("x-requests-last", 0) or 0),
             "remaining": resp.headers.get("x-requests-remaining")}
     return resp.json().get("data", []), meta
+
+
+def fair_probs(event: dict, line: float = None) -> dict:
+    """
+    Consensus no-vig probability per selection, averaged over bookmakers that quote the FULL two-way
+    market. Returns {key: (probability, number_of_books)} with the same keys selection_rows uses:
+    h2h:home/away, spreads:home_-1.5 etc., totals:over/under (only at `line`).
+    Spreads are only paired as (home -1.5 with away +1.5) or (away -1.5 with home +1.5).
+    """
+    home, away = event["home_team"], event["away_team"]
+    acc = {}
+
+    def add(k_a, k_b, price_a, price_b):
+        inv_a, inv_b = 1 / price_a, 1 / price_b
+        tot = inv_a + inv_b
+        if tot < 0.97:                      # a real two-way market always carries a margin
+            return
+        acc.setdefault(k_a, []).append(inv_a / tot)
+        acc.setdefault(k_b, []).append(inv_b / tot)
+
+    for bk in event.get("bookmakers", []):
+        for mkt in bk.get("markets", []):
+            outs = mkt["outcomes"]
+            if mkt["key"] == "h2h":
+                if len(outs) != 2 or any(o["name"].lower() == "draw" for o in outs):
+                    continue                # 3-way regulation market: not comparable
+                px = {o["name"]: o["price"] for o in outs}
+                if home in px and away in px:
+                    add("h2h:home", "h2h:away", px[home], px[away])
+            elif mkt["key"] == "spreads":
+                px = {}
+                for o in outs:
+                    side = "home" if o["name"] == home else "away" if o["name"] == away else None
+                    if side and o.get("point") in (-1.5, 1.5):
+                        px[(side, o["point"])] = o["price"]
+                for hs, hp, as_, ap in (("home", -1.5, "away", 1.5), ("away", -1.5, "home", 1.5)):
+                    if (hs, hp) in px and (as_, ap) in px:
+                        add(f"spreads:{hs}_{hp:+g}", f"spreads:{as_}_{ap:+g}", px[(hs, hp)], px[(as_, ap)])
+            elif mkt["key"] == "totals" and line is not None:
+                over = [o["price"] for o in outs if o["name"].lower() == "over" and o.get("point") == line]
+                under = [o["price"] for o in outs if o["name"].lower() == "under" and o.get("point") == line]
+                if over and under:
+                    add("totals:over", "totals:under", over[0], under[0])
+    return {k: (sum(v) / len(v), len(v)) for k, v in acc.items()}
