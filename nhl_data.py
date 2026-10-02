@@ -273,3 +273,21 @@ def debug_sample_boxscore(game_id: int):
     pbs = box.get("playerByGameStats", {})
     print("playerByGameStats keys:", list(pbs.keys()))
     print("goalies sample:", (pbs.get("homeTeam", {}).get("goalies") or [])[:2])
+
+
+def get_scoreboard(day: str) -> list[dict]:
+    """
+    Every game on a date with its state and current/final score (scores are None before the puck drops).
+    state: FUT/PRE (not started), LIVE/CRIT (in progress), OFF/FINAL (finished).
+    """
+    payload = _get_json(f"{NHL_API_BASE}/schedule/{day}")
+    out = []
+    for wk in payload.get("gameWeek", []):
+        if wk.get("date") != day:
+            continue
+        for g in wk.get("games", []):
+            h, a = g.get("homeTeam", {}), g.get("awayTeam", {})
+            out.append({"id": g["id"], "state": g.get("gameState"), "home": h.get("abbrev"), "away": a.get("abbrev"),
+                        "home_score": h.get("score"), "away_score": a.get("score"),
+                        "last_period": (g.get("gameOutcome") or {}).get("lastPeriodType", "REG")})
+    return out

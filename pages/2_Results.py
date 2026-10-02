@@ -4,6 +4,7 @@ from common import get_api_key
 from nhl_data import get_completed_games_range
 from nhl_backtest import build_free_results, build_priced_results, pick_games, snapshot_ts
 from odds import fetch_historical_odds, COST_LOG
+from nhl_lights import add_lights, lights_summary, GREEN, AMBER, RED, NONE
 
 st.set_page_config(page_title="NHL Model - Results", layout="centered")
 st.title("📋 NHL Results")
@@ -60,6 +61,9 @@ if st.button("Load results"):
                         "remaining": COST_LOG[-1]["remaining"] if COST_LOG else None}
             else:
                 rdf, note = build_free_results(day)
+            if priced and rdf is not None and not rdf.empty:
+                rdf = add_lights(rdf, edge_col="Edge vs market (pp)", books_col="Books", gp_col="Min GP")
+                rdf["Edge ref (pp)"] = rdf["Edge vs market (pp)"].fillna(rdf["Edge (pp)"])
             st.session_state["res"] = {"df": rdf, "note": note, "day": str(day), "priced": priced, "cost": cost}
         except Exception as e:
             st.error(f"Couldn't load results: {e}")
@@ -81,9 +85,13 @@ if r and r["day"] == str(day):
                              help="Only count selections where the model beat the price by at least this much.") \
             if r["priced"] else None
 
+        lights = st.multiselect("Lights to include", [GREEN, AMBER, RED, NONE], default=[GREEN, AMBER, RED, NONE]) \
+            if r["priced"] else None
         sub = rdf[(rdf["Model %"] >= floor) & (~rdf["Push"])]
         if min_edge is not None:
             sub = sub[sub["Edge (pp)"] >= min_edge]
+        if lights is not None:
+            sub = sub[sub["Light"].isin(lights)]
         if sub.empty:
             st.warning("No picks at or above those filters on this date.")
         else:
@@ -111,6 +119,11 @@ if r and r["day"] == str(day):
                 st.info(f"Model said {avg_model:.1f}% and {rate:.1f}% landed - underconfident on this slate.")
             st.caption("One slate is a small sample. The Backtest page is where calibration is judged properly.")
 
+            if r["priced"]:
+                st.markdown("#### Outcomes by light")
+                st.caption("Do the lights separate good picks from bad ones? One slate says nothing; this table is "
+                           "meant to accumulate evidence across dates.")
+                st.dataframe(lights_summary(sub), width="stretch", hide_index=True)
             tabs = st.tabs(["📊 All", "Moneyline", "Puck line", "Total"])
             for tab, mk in zip(tabs, [None, "Moneyline", "Puck line", "Total"]):
                 with tab:
@@ -125,7 +138,7 @@ if r and r["day"] == str(day):
                     st.markdown(hdr)
                     disp = t.copy()
                     disp["Result"] = disp["Hit"].map({True: "✅", False: "❌"})
-                    cols = ["Result", "Selection", "Market", "Model %", "Implied %", "Edge (pp)", "Odds", "Book",
+                    cols = ["Light", "Result", "Selection", "Market", "Model %", "Implied %", "Edge (pp)", "Edge vs market (pp)", "Odds", "Book",
                             "P/L (1u)", "Game", "Score"] if r["priced"] else \
                            ["Result", "Selection", "Market", "Model %", "Game", "Score"]
                     cols = [c for c in cols if c in disp.columns and not (mk and c == "Market")]

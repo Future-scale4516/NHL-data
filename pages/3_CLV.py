@@ -4,6 +4,7 @@ from common import get_api_key
 from nhl_data import get_completed_games_range
 from nhl_clv import build_clv_frame, clv_summary, plan_snapshots, CREDITS_PER_SNAPSHOT
 from odds import fetch_historical_odds, COST_LOG
+from nhl_lights import add_lights, lights_summary
 
 st.set_page_config(page_title="NHL Model - CLV", layout="centered")
 st.title("📈 Closing Line Value")
@@ -126,6 +127,12 @@ if r:
         st.caption("If the model has real information, higher-edge picks should show a larger market move. A flat "
                    "or backwards pattern means the edge isn't real.")
         st.dataframe(s["by_edge"].round(2), width="stretch", hide_index=True)
+
+        st.markdown("#### By traffic light")
+        st.caption("Do the lights earn their keep? Green should show a larger market move than amber or red, and "
+                   "red should show none. Only meaningful once there are a few hundred picks.")
+        lit = add_lights(df, edge_col="Edge vs consensus (pp)", books_col="Close books", gp_col="Min GP")
+        st.dataframe(lights_summary(lit), width="stretch", hide_index=True)
 
         with st.expander("All priced selections"):
             cols = ["Date", "Game", "Selection", "Model %", "Pick fair %", "Edge vs consensus (pp)", "Odds", "Book",

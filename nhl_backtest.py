@@ -18,7 +18,7 @@ from nhl_data import (get_standings, get_completed_games_range, compute_team_str
                       prior_season_end_date, prior_is_valid)
 from model import (expected_goals, score_matrix, moneyline_probs, puck_line_probs,
                    puck_line_probs_with_empty_net, totals_probs)
-from odds import match_event, best_prices
+from odds import match_event, best_prices, fair_probs
 
 TEST_LINES = (5.5, 6.5)   # no-push lines, so calibration is clean
 
@@ -282,7 +282,7 @@ def tuning_diagnostics(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------- results (per date) ----------
-def selection_rows(g: dict, mdl: dict, prices=None, fixed_line=5.5) -> list[dict]:
+def selection_rows(g: dict, mdl: dict, prices=None, fixed_line=5.5, fair=None, min_gp=None) -> list[dict]:
     """
     Every selection the model prices for one finished game, settled against the real result.
     prices=None -> model-only (Totals at fixed_line); otherwise only priced selections are kept,
@@ -331,6 +331,12 @@ def selection_rows(g: dict, mdl: dict, prices=None, fixed_line=5.5) -> list[dict
                         "Edge (pp)": round(p * 100 - 100 / price, 1),
                         "P/L (1u)": 0.0 if push else (round(price - 1, 2) if hit else -1.0),
                         "Key": key})
+            if fair is not None:
+                cons = fair.get(key)
+                ok = bool(cons) and cons[1] >= 2
+                row.update({"Market %": round(cons[0] * 100, 1) if cons else None, "Books": cons[1] if cons else 0,
+                            "Edge vs market (pp)": round(p * 100 - cons[0] * 100, 2) if ok else None,
+                            "Min GP": min_gp})
         rows.append(row)
     return rows
 
@@ -385,7 +391,11 @@ def build_priced_results(day: date, max_games: int, fetch_snapshot, lead_minutes
         if not event:
             no_odds += 1
             continue
-        rows += selection_rows(g, compute_model(g["home"], g["away"], strengths), prices=best_prices(event))
+        prices = best_prices(event)
+        line = prices["totals"]["line"] if prices["totals"] else None
+        gp = min(strengths[g["home"]]["games_played"], strengths[g["away"]]["games_played"])
+        rows += selection_rows(g, compute_model(g["home"], g["away"], strengths), prices=prices,
+                               fair=fair_probs(event, line=line), min_gp=gp)
     note = (f"{len(chosen)} game(s) reconstructed on {day}, priced from the snapshot {lead_minutes} min "
             "before each game's own start.")
     if no_odds:

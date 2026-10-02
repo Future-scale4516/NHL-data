@@ -66,12 +66,29 @@ def parse_goalies(payload: dict) -> list[dict]:
     return out
 
 
+def parse_skaters(payload: dict) -> list[dict]:
+    """Skaters who played (TOI > 0): shots on goal and ice time, tagged forward/defence."""
+    out = []
+    stats = payload.get("playerByGameStats") or {}
+    for side, other in (("homeTeam", "awayTeam"), ("awayTeam", "homeTeam")):
+        team, opp = (payload.get(side) or {}).get("abbrev"), (payload.get(other) or {}).get("abbrev")
+        for grp in ("forwards", "defense"):
+            for pl in (stats.get(side) or {}).get(grp) or []:
+                toi = _toi_seconds(pl.get("toi"))
+                if not toi:
+                    continue
+                out.append({"team": team, "opp": opp, "player_id": pl.get("playerId"),
+                            "name": (pl.get("name") or {}).get("default"), "pos": "D" if grp == "defense" else "F",
+                            "toi": toi, "sog": int(pl.get("sog") or 0)})
+    return out
+
+
 # ---------- fetching ----------
-def fetch_goalie_log(games: list[dict], progress=None):
+def fetch_boxscores(games: list[dict], progress=None):
     """
-    Goalie rows for every game. Returns (DataFrame, failed {game_id: error}).
-    Cached per game, so a re-run only retries failures. Modest parallelism + a slow second pass,
-    because the NHL API rate-limits bursts (429).
+    One box score per game -> (goalie rows, skater rows, failed {game_id: error}). Cached per game, so a
+    re-run only retries failures, and the goalie test and the shots-on-goal backtest share the same fetch.
+    Modest parallelism + a slow second pass, because the NHL API rate-limits bursts (429).
     """
     date_of = {g["id"]: g["date"] for g in games}
     ids = list(date_of)
@@ -88,16 +105,16 @@ def fetch_goalie_log(games: list[dict], progress=None):
             pbs = payload.get("playerByGameStats") or {}
             return gid, None, (f"no goalie rows parsed; top-level keys {list(payload)[:12]}; "
                                f"playerByGameStats keys {list(pbs)[:6]}")
-        _BOX_CACHE[gid] = rows
-        return gid, rows, None
+        _BOX_CACHE[gid] = {"goalies": rows, "skaters": parse_skaters(payload)}
+        return gid, _BOX_CACHE[gid], None
 
     results, errors = {}, {}
     with ThreadPoolExecutor(max_workers=4) as ex:
-        for i, (gid, rows, err) in enumerate(ex.map(one, ids)):
+        for i, (gid, rec, err) in enumerate(ex.map(one, ids)):
             if err:
                 errors[gid] = err
             else:
-                results[gid] = rows
+                results[gid] = rec
             if progress:
                 progress(0.85 * (i + 1) / len(ids))
     retry = [g for g in ids if g not in results]
@@ -106,17 +123,24 @@ def fetch_goalie_log(games: list[dict], progress=None):
         for i, gid in enumerate(retry):
             if i:
                 time.sleep(3)
-            _, rows, err = one(gid, tries=6)
+            _, rec, err = one(gid, tries=6)
             if err:
                 errors[gid] = err
             else:
-                results[gid] = rows
+                results[gid] = rec
                 errors.pop(gid, None)
             if progress:
                 progress(0.85 + 0.15 * (i + 1) / len(retry))
 
-    log = [dict(r, game_id=gid, date=date_of[gid]) for gid, rows in results.items() for r in rows]
-    return pd.DataFrame(log), {g: e for g, e in errors.items() if g not in results}
+    goalies = [dict(r, game_id=gid, date=date_of[gid]) for gid, rec in results.items() for r in rec["goalies"]]
+    skaters = [dict(r, game_id=gid, date=date_of[gid]) for gid, rec in results.items() for r in rec["skaters"]]
+    return pd.DataFrame(goalies), pd.DataFrame(skaters), {g: e for g, e in errors.items() if g not in results}
+
+
+def fetch_goalie_log(games: list[dict], progress=None):
+    """Goalie rows only. Returns (DataFrame, failed {game_id: error})."""
+    goalies, _, failed = fetch_boxscores(games, progress)
+    return goalies, failed
 
 
 # ---------- point-in-time goalie ratings ----------

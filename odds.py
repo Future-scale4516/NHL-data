@@ -8,6 +8,7 @@ import unicodedata
 from collections import Counter
 from datetime import datetime
 
+import pandas as pd
 import requests
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -182,3 +183,35 @@ def fair_probs(event: dict, line: float = None) -> dict:
                 if over and under:
                     add("totals:over", "totals:under", over[0], under[0])
     return {k: (sum(v) / len(v), len(v)) for k, v in acc.items()}
+
+
+PROP_MARKET_SOG = "player_shots_on_goal"
+
+
+def fetch_event_props(api_key: str, event_id: str, market: str = PROP_MARKET_SOG):
+    """
+    Player props for ONE event (props are only served per event). Costs 1 credit per market per region.
+    Returns (event json, meta). An event with no prop prices comes back with an empty bookmakers list.
+    """
+    resp = requests.get(
+        f"{ODDS_API_BASE}/sports/{SPORT_KEY}/events/{event_id}/odds",
+        params={"apiKey": api_key, "regions": REGIONS, "markets": market, "oddsFormat": "decimal"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json(), {"last": int(resp.headers.get("x-requests-last", 0) or 0),
+                         "remaining": resp.headers.get("x-requests-remaining")}
+
+
+def props_table(event: dict, market: str = PROP_MARKET_SOG) -> pd.DataFrame:
+    """Flat rows: player, line, side, price, book."""
+    rows = []
+    for bk in event.get("bookmakers", []):
+        for mkt in bk.get("markets", []):
+            if mkt["key"] != market:
+                continue
+            for o in mkt["outcomes"]:
+                if o.get("description") and o.get("point") is not None:
+                    rows.append({"player": o["description"], "line": float(o["point"]), "side": o["name"].lower(),
+                                 "price": o["price"], "book": bk["title"]})
+    return pd.DataFrame(rows, columns=["player", "line", "side", "price", "book"])

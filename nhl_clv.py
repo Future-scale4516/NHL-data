@@ -98,6 +98,7 @@ def build_clv_frame(start: date, end: date, fetch_snapshot, pick_lead: int = 180
                 dropped += 1
                 continue
             r.update({"Date": g["date"], "Game ID": g["id"],
+                      "Min GP": min(strengths[g["home"]]["games_played"], strengths[g["away"]]["games_played"]),
                       "Pick fair %": round(fp[0] * 100, 1), "Close fair %": round(fc[0] * 100, 1),
                       "Close books": fc[1],
                       "Edge vs consensus (pp)": round(r["Model %"] - fp[0] * 100, 2),
