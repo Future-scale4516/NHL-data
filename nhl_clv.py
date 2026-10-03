@@ -25,18 +25,31 @@ import pandas as pd
 from nhl_data import get_completed_games_range, compute_team_strengths
 from nhl_backtest import (prior_table, plausible_gp, fetch_standings_for, compute_model,
                           selection_rows, snapshot_ts)
+from collections import Counter
+
 from odds import match_event, best_prices, fair_probs
 
-CREDITS_PER_SNAPSHOT = 30      # 10 per market x 3 markets x 1 region
 MIN_CLOSE_BOOKS = 2            # closing consensus needs at least this many books quoting the market
 
 
-def plan_snapshots(games: list[dict], pick_lead: int, close_lead: int, max_snapshots: int):
+def slot_filter(games: list[dict], pick_lead: int, min_games_per_slot: int = 1) -> list[dict]:
+    """
+    Keep only games whose start time is shared by at least `min_games_per_slot` games. Games that start together
+    share the same two snapshots, so busy slots are far cheaper per game than a lone late start.
+    """
+    games = sorted((g for g in games if g.get("start_utc")), key=lambda g: g["start_utc"])
+    if min_games_per_slot <= 1:
+        return games
+    n = Counter((g["date"], snapshot_ts(g["start_utc"], pick_lead)) for g in games)
+    return [g for g in games if n[(g["date"], snapshot_ts(g["start_utc"], pick_lead))] >= min_games_per_slot]
+
+
+def plan_snapshots(games: list[dict], pick_lead: int, close_lead: int, max_snapshots: int, min_games_per_slot: int = 1):
     """
     Which games fit under the snapshot cap (chronological), and what the full range would need.
     Returns (games_covered, distinct_snapshots_needed_for_all, distinct_snapshots_used).
     """
-    games = sorted((g for g in games if g.get("start_utc")), key=lambda g: g["start_utc"])
+    games = slot_filter(games, pick_lead, min_games_per_slot)
     all_ts = {t for g in games for t in (snapshot_ts(g["start_utc"], pick_lead),
                                          snapshot_ts(g["start_utc"], close_lead))}
     used, covered = set(), []
@@ -48,8 +61,17 @@ def plan_snapshots(games: list[dict], pick_lead: int, close_lead: int, max_snaps
     return covered, len(all_ts), len(used)
 
 
+def pool_frames(frames: list) -> pd.DataFrame:
+    """Combine CLV runs done in chunks. The same game + selection is only ever counted once."""
+    frames = [f for f in frames if f is not None and len(f)]
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    return out.drop_duplicates(["Game ID", "Key"], keep="first").reset_index(drop=True)
+
+
 def build_clv_frame(start: date, end: date, fetch_snapshot, pick_lead: int = 180, close_lead: int = 5,
-                    max_snapshots: int = 30, progress=None):
+                    max_snapshots: int = 30, progress=None, min_games_per_slot: int = 1):
     """
     One row per priced selection: model %, best pick-time odds/edge, closing fair %, CLV.
     fetch_snapshot(ts) -> list of odds events (caching lives in the page).
@@ -57,11 +79,15 @@ def build_clv_frame(start: date, end: date, fetch_snapshot, pick_lead: int = 180
     """
     prior_teams = prior_table(start)
     games = get_completed_games_range(start, end)
-    covered, n_all, n_used = plan_snapshots(games, pick_lead, close_lead, max_snapshots)
+    eligible = slot_filter(games, pick_lead, min_games_per_slot)
+    covered, n_all, n_used = plan_snapshots(games, pick_lead, close_lead, max_snapshots, min_games_per_slot)
     notes = []
-    if len(covered) < len([g for g in games if g.get("start_utc")]):
-        first_cut = min((g["date"] for g in games if g["id"] not in {c["id"] for c in covered}), default=None)
-        notes.append(f"Snapshot cap ({max_snapshots}) reached: scored {len(covered)} of {len(games)} games, "
+    if len(eligible) < len([g for g in games if g.get("start_utc")]):
+        notes.append(f"{len([g for g in games if g.get('start_utc')]) - len(eligible)} game(s) skipped because they "
+                     f"start alone (fewer than {min_games_per_slot} games share the start time).")
+    if len(covered) < len(eligible):
+        first_cut = min((g["date"] for g in eligible if g["id"] not in {c["id"] for c in covered}), default=None)
+        notes.append(f"Snapshot cap ({max_snapshots}) reached: scored {len(covered)} of {len(eligible)} games, "
                      f"stopping before {first_cut}. Raise the cap or shorten the date range for the rest.")
 
     dates = sorted({g["date"] for g in covered})
@@ -75,14 +101,25 @@ def build_clv_frame(start: date, end: date, fetch_snapshot, pick_lead: int = 180
         ok = bool(teams) and plausible_gp(date.fromisoformat(d_iso), teams)
         strengths_by_date[d_iso] = compute_team_strengths(teams, prior_teams) if ok else None
 
-    rows, no_odds, dropped, no_str = [], 0, 0, 0
+    rows, no_odds, dropped, no_str, fetch_failed, first_err, stopped = [], 0, 0, 0, 0, None, None
     for n, g in enumerate(covered):
         strengths = strengths_by_date.get(g["date"])
         if not strengths or g["home"] not in strengths or g["away"] not in strengths:
             no_str += 1
             continue
-        ev_pick = match_event(fetch_snapshot(snapshot_ts(g["start_utc"], pick_lead)), g["home"], g["away"], g["start_utc"])
-        ev_close = match_event(fetch_snapshot(snapshot_ts(g["start_utc"], close_lead)), g["home"], g["away"], g["start_utc"])
+        try:
+            evs_pick = fetch_snapshot(snapshot_ts(g["start_utc"], pick_lead))
+            evs_close = fetch_snapshot(snapshot_ts(g["start_utc"], close_lead))
+        except Exception as exc:                         # keep everything scored so far; never lose a paid-for run
+            msg = str(exc)
+            if "401" in msg or "OUT_OF_USAGE" in msg:    # out of credits / bad key: every further call would fail too
+                stopped = (g["date"], msg[:200])
+                break
+            fetch_failed += 1
+            first_err = first_err or msg[:160]
+            continue
+        ev_pick = match_event(evs_pick, g["home"], g["away"], g["start_utc"])
+        ev_close = match_event(evs_close, g["home"], g["away"], g["start_utc"])
         if progress:
             progress(0.25 + 0.75 * (n + 1) / len(covered))
         if not ev_pick or not ev_close:
@@ -109,6 +146,12 @@ def build_clv_frame(start: date, end: date, fetch_snapshot, pick_lead: int = 180
     notes.append(f"{len(covered)} games planned ({n_used} snapshots); {len(set(r['Game ID'] for r in rows))} had "
                  f"usable pick + closing odds. {no_odds} had no odds in a snapshot; {dropped} selections dropped "
                  "(consensus from 2+ books missing at pick or close, or the totals line moved).")
+    if stopped:
+        notes.insert(0, f"⚠ Stopped at {stopped[0]} because the Odds API refused the request ({stopped[1]}). Everything "
+                        "scored before that is kept below: download it, then continue from that date.")
+    if fetch_failed:
+        notes.append(f"⚠ {fetch_failed} game(s) skipped because their odds snapshot failed to load (first error: "
+                     f"{first_err}).")
     if no_str:
         notes.append(f"{no_str} game(s) skipped: no point-in-time standings.")
     return pd.DataFrame(rows), notes

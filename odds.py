@@ -124,21 +124,36 @@ def best_prices(event: dict) -> dict:
 COST_LOG = []   # one entry per real (uncached) historical call; lets the UI report credits spent
 
 
-def fetch_historical_odds(api_key: str, iso_ts: str):
+def credits_per_snapshot(markets: str = MARKETS) -> int:
+    """Historical odds cost 10 credits per market per region."""
+    return 10 * len([m for m in markets.split(",") if m]) * len([r for r in REGIONS.split(",") if r])
+
+
+def fetch_historical_odds(api_key: str, iso_ts: str, markets: str = MARKETS):
     """
-    Odds snapshot as of iso_ts (YYYY-MM-DDTHH:MM:SSZ). Historical calls bill 10 credits per
-    region per market (3 markets x 1 region = 30). Returns (events, meta).
+    Odds snapshot as of iso_ts (YYYY-MM-DDTHH:MM:SSZ). Historical calls bill 10 credits per region per market.
+    Retries rate limits / server errors with backoff. A 401 (out of credits or bad key) is raised at once with the
+    API's own message. Returns (events, meta).
     """
-    resp = requests.get(
-        f"{ODDS_API_BASE}/historical/sports/{SPORT_KEY}/odds",
-        params={"apiKey": api_key, "regions": REGIONS, "markets": MARKETS,
-                "oddsFormat": "decimal", "date": iso_ts},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    meta = {"last": int(resp.headers.get("x-requests-last", 0) or 0),
-            "remaining": resp.headers.get("x-requests-remaining")}
-    return resp.json().get("data", []), meta
+    import time
+    last = None
+    for i in range(4):
+        resp = requests.get(
+            f"{ODDS_API_BASE}/historical/sports/{SPORT_KEY}/odds",
+            params={"apiKey": api_key, "regions": REGIONS, "markets": markets, "oddsFormat": "decimal", "date": iso_ts},
+            timeout=20,
+        )
+        if resp.status_code == 401:
+            raise RuntimeError(f"401 from the Odds API (out of credits or invalid key): {resp.text[:200]}")
+        if resp.status_code in (429, 500, 502, 503, 504):
+            last = f"{resp.status_code} {resp.text[:120]}"
+            time.sleep(1.5 * 2 ** i)
+            continue
+        resp.raise_for_status()
+        meta = {"last": int(resp.headers.get("x-requests-last", 0) or 0),
+                "remaining": resp.headers.get("x-requests-remaining")}
+        return resp.json().get("data", []), meta
+    raise RuntimeError(f"Odds API kept failing after retries: {last}")
 
 
 def fair_probs(event: dict, line: float = None) -> dict:

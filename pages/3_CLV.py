@@ -1,9 +1,10 @@
+import pandas as pd
 import streamlit as st
-from datetime import date, timedelta
+from datetime import date
 from common import get_api_key
 from nhl_data import get_completed_games_range
-from nhl_clv import build_clv_frame, clv_summary, plan_snapshots, CREDITS_PER_SNAPSHOT
-from odds import fetch_historical_odds, COST_LOG
+from nhl_clv import build_clv_frame, clv_summary, plan_snapshots, slot_filter, pool_frames
+from odds import fetch_historical_odds, credits_per_snapshot, COST_LOG
 from nhl_lights import add_lights, lights_summary
 
 st.set_page_config(page_title="NHL Model - CLV", layout="centered")
@@ -12,6 +13,10 @@ st.caption("The best test of whether the model finds real edges. For each game: 
            "some time before the start (what you could have bet) and compare it with the de-vigged consensus at "
            "the close. If the picks the model flags beat the close more than ordinary selections do, the market "
            "moved toward the model. Uses historical odds credits.")
+st.info("**Run it a week at a time.** Each run is cached for a day, but the cache disappears if the app restarts, so "
+        "download each run's CSV and pool them at the bottom. Nothing you've already paid for is ever re-fetched or "
+        "lost that way. Check your remaining credits on the Odds API dashboard first: MLB and NFL draw from the "
+        "same pool.")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -20,31 +25,41 @@ def cached_games(s_iso, e_iso):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)   # a snapshot already fetched is never paid for twice
-def cached_snapshot(api_key, ts):
-    events, meta = fetch_historical_odds(api_key, ts)
+def cached_snapshot(api_key, ts, markets):
+    events, meta = fetch_historical_odds(api_key, ts, markets)
     COST_LOG.append(meta)                        # only runs on a real (uncached) call
     return events
 
 
 c1, c2 = st.columns(2)
-start = c1.date_input("From", value=date(2026, 3, 23), key="clv_start")
-end = c2.date_input("To", value=date(2026, 3, 29), key="clv_end")
+start = c1.date_input("From", value=date(2026, 3, 2), key="clv_start",
+                      help="The second half of the season is where the model showed skill, so test there.")
+end = c2.date_input("To", value=date(2026, 3, 8), key="clv_end")
 c3, c4 = st.columns(2)
 pick_lead = c3.selectbox("Pick price taken (min before start)", [60, 120, 180, 360], index=2,
                          help="Earlier = more time for the market to move toward (or away from) the model, "
                               "and for goalie news to land.")
 close_lead = c4.selectbox("Closing price taken (min before start)", [5, 10], index=0)
-max_snap = st.slider("Max snapshots to fetch", 6, 80, 30, 2,
-                     help=f"Each snapshot costs {CREDITS_PER_SNAPSHOT} credits. Games are taken in date order "
-                          "until the cap is reached.")
+c5, c6 = st.columns(2)
+puck = c5.checkbox("Include the puck line", value=False,
+                   help="Adds a third market (+10 credits per snapshot). UK books rarely price the puck line "
+                        "through this feed, so it mostly adds cost, not data.")
+min_slot = c6.selectbox("Only start times shared by at least N games", [1, 2, 3], index=1,
+                        help="Games that start together share the same two snapshots, so busy slots are much "
+                             "cheaper per game than a lone late start.")
+markets = "h2h,spreads,totals" if puck else "h2h,totals"
+cps = credits_per_snapshot(markets)
+cap = st.slider("Max credits to spend this run", 200, 3000, 1000, 100)
+max_snap = max(2, cap // cps)
 
 try:
     games = cached_games(str(start), str(end))
-    covered, n_all, n_used = plan_snapshots(games, pick_lead, close_lead, max_snap)
-    st.warning(f"**Credit cost:** {len(games)} completed games in this range need **{n_all} distinct snapshots "
-               f"(about {CREDITS_PER_SNAPSHOT * n_all} credits)** to cover fully. With your cap this run covers "
-               f"{len(covered)} games using {n_used} snapshots, **about {CREDITS_PER_SNAPSHOT * n_used} credits** "
-               "(less if some are already cached).")
+    eligible = slot_filter(games, pick_lead, min_slot)
+    covered, n_all, n_used = plan_snapshots(games, pick_lead, close_lead, max_snap, min_slot)
+    st.warning(f"**Credit cost:** {len(games)} completed games in this range; {len(eligible)} qualify after the "
+               f"start-time filter and need **{n_all} snapshots x {cps} credits = about {cps * n_all} credits** to "
+               f"cover fully. Your cap covers {len(covered)} games using {n_used} snapshots, **about "
+               f"{cps * n_used} credits** (less if some are already cached).")
 except Exception as e:
     st.caption(f"Couldn't pre-count games for the cost estimate: {e}")
 
@@ -58,25 +73,34 @@ elif st.button("Build CLV report"):
     bar = st.progress(0.0, text="Fetching standings and odds snapshots...")
     try:
         COST_LOG.clear()
-        df, notes = build_clv_frame(start, end, lambda ts: cached_snapshot(api_key, ts), pick_lead, close_lead,
-                                    max_snap, progress=lambda f: bar.progress(min(f, 1.0)))
+        df, notes = build_clv_frame(start, end, lambda ts: cached_snapshot(api_key, ts, markets), pick_lead, close_lead,
+                                    max_snap, progress=lambda f: bar.progress(min(f, 1.0)), min_games_per_slot=min_slot)
         cost = {"credits": sum(m["last"] for m in COST_LOG),
                 "remaining": COST_LOG[-1]["remaining"] if COST_LOG else None}
-        st.session_state["nhl_clv"] = {"df": df, "notes": notes, "cost": cost}
+        st.session_state["nhl_clv"] = {"df": df, "notes": notes, "cost": cost, "start": str(start), "end": str(end)}
     except Exception as e:
         st.error(f"CLV report failed: {e}")
     bar.empty()
 
 r = st.session_state.get("nhl_clv")
+st.markdown("#### Pool earlier runs")
+uploads = st.file_uploader("Add CSVs from earlier runs (each game and selection is counted once)", type="csv",
+                           accept_multiple_files=True)
+frames = ([r["df"]] if r else []) + [pd.read_csv(u) for u in uploads]
+df = pool_frames(frames)
+
 if r:
-    df = r["df"]
     for n in r["notes"]:
         (st.warning if n.startswith("⚠") else st.caption)(n)
     if r["cost"]["credits"]:
         st.caption(f"Odds API: this run used ~{r['cost']['credits']} credits, {r['cost']['remaining']} remaining.")
-    if df.empty:
-        st.warning("No usable picks. Check that the date range is a past regular-season stretch with odds coverage.")
-    else:
+
+if df.empty:
+    st.info("No results yet. Build a report above, or upload CSVs from earlier runs.")
+else:
+    st.caption(f"Analysing {len(df)} priced selections from {df['Game ID'].nunique()} games"
+               + (f" ({len(frames)} runs pooled)" if len(frames) > 1 else "") + ".")
+    if True:
         f1, f2 = st.columns(2)
         min_edge = f1.slider("Flag a pick when the model beats the CONSENSUS price by at least (pp)", 0, 10, 3, 1,
                              help="Measured against the average de-vigged price at pick time, not the best price: "
@@ -103,6 +127,10 @@ if r:
                   "evidence only: in testing it carries a small positive bias (~0.2pp) from price noise.")
         m6.metric("Flagged picks the market moved toward", f"{mv['beat']:.0f}%" if ok else "n/a")
 
+        if ok and mv["ci"]:
+            half = (mv["ci"][1] - mv["ci"][0]) / 2
+            st.caption(f"With this sample the interval is about ±{half:.2f}pp, so a real average market move smaller "
+                       "than that can't be told apart from zero.")
         if s["n_flag"] < 30 or not mv["ci"]:
             st.info(f"Only {s['n_flag']} flagged picks: too few to conclude anything. Widen the date range, raise "
                     "the snapshot cap, or lower the edge threshold.")
@@ -135,9 +163,13 @@ if r:
         st.dataframe(lights_summary(lit), width="stretch", hide_index=True)
 
         with st.expander("All priced selections"):
-            cols = ["Date", "Game", "Selection", "Model %", "Pick fair %", "Edge vs consensus (pp)", "Odds", "Book",
-                    "Close fair %", "Market move (pp)", "CLV (pp)", "Hit", "P/L (1u)"]
+            cols = [c for c in ["Date", "Game", "Selection", "Model %", "Pick fair %", "Edge vs consensus (pp)", "Odds",
+                                "Book", "Close fair %", "Market move (pp)", "CLV (pp)", "Hit", "P/L (1u)"] if c in df.columns]
             st.dataframe(df[cols].sort_values("Edge vs consensus (pp)", ascending=False),
                          width="stretch", hide_index=True)
-        st.download_button("Download CLV CSV", data=df.to_csv(index=False).encode("utf-8"),
-                           file_name=f"nhl_clv_{start}_{end}.csv", mime="text/csv")
+        if r is not None and len(r["df"]):
+            st.download_button("Download this run's CSV", data=r["df"].to_csv(index=False).encode("utf-8"),
+                               file_name=f"nhl_clv_{r['start']}_{r['end']}.csv", mime="text/csv")
+        if len(frames) > 1:
+            st.download_button("Download pooled CSV", data=df.to_csv(index=False).encode("utf-8"),
+                               file_name="nhl_clv_pooled.csv", mime="text/csv")
