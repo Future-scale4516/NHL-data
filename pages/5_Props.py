@@ -3,12 +3,13 @@ import plotly.graph_objects as go
 import streamlit as st
 from datetime import date
 from common import get_api_key, cached_odds
-from nhl_data import get_completed_games_range
+from nhl_data import get_completed_games_range, get_games, get_boxscore
 from nhl_live import load_slate
 from nhl_goalies import fetch_boxscores
 from nhl_backtest import calibration, season_start_year
 from nhl_lights import GREEN, AMBER, RED, NONE, LIGHT_CONFIG
-from nhl_props import (NB_R, sog_backtest, fetch_stats_table, player_table, team_factors, props_selections)
+from nhl_props import (NB_R, sog_backtest, fetch_stats_table, player_table, team_factors, props_selections,
+                       parse_ladder_text, ladder_table, settle_ladder, ladder_summary)
 from odds import fetch_event_props, COST_LOG
 
 st.set_page_config(page_title="NHL Model - Shots on goal", layout="centered")
@@ -31,7 +32,28 @@ def cached_props(api_key, event_id):
     return event
 
 
-live_tab, cal_tab = st.tabs(["Live props", "Calibration backtest"])
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_games(day_iso):
+    return get_games(day_iso)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_box(game_id):
+    return get_boxscore(game_id)
+
+
+def load_tables(day):
+    """Skater table (this + last season) and opponent shot-suppression factors."""
+    y = season_start_year(day)
+    table = player_table(cached_stats("skater/summary", f"{y}{y + 1}"), cached_stats("skater/summary", f"{y - 1}{y}"))
+    try:
+        tfac = team_factors(cached_stats("team/summary", f"{y}{y + 1}"), cached_stats("team/summary", f"{y - 1}{y}"))
+    except Exception:
+        tfac = {}
+    return table, tfac
+
+
+live_tab, ladder_tab, cal_tab = st.tabs(["Live props", "bet365 ladder", "Calibration backtest"])
 
 with cal_tab:
     st.caption("Replays a whole season of box scores through the model, using only earlier games for every prediction. "
@@ -165,3 +187,83 @@ with live_tab:
             st.dataframe(show[cols], width="stretch", hide_index=True)
             st.download_button("Download props CSV", data=sel.to_csv(index=False).encode("utf-8"),
                                file_name=f"nhl_sog_{sg['day']}.csv", mime="text/csv")
+
+with ladder_tab:
+    st.caption("bet365 isn't in the odds feed, so type its 'X or more shots' ladder in here. Each rung is priced with the "
+               "model and compared with bet365's price. Log what you check, then settle it against real box scores "
+               "later: that is the only way to find out whether the model beats bet365's actual prices.")
+    ldate = st.date_input("Date", value=date.today(), key="lad_day")
+    try:
+        slate_games = cached_games(str(ldate))
+    except Exception as exc:
+        slate_games = []
+        st.warning(f"Couldn't load the schedule: {exc}")
+    if not slate_games:
+        st.info("No games found for that date.")
+    else:
+        labels = {f"{g['away']} @ {g['home']}": g for g in slate_games}
+        pick = st.selectbox("Game", list(labels))
+        text = st.text_area("Paste or type the ladder (one player per line: name, then the prices for 1+, 2+, 3+ ...)",
+                            height=170, key="lad_text",
+                            placeholder="Andrei Svechnikov 1.04 1.25 1.79 3.05 5.50\nOwen Tippett 1.066 1.40 2.30 4.30 8.50")
+        ladder_r = st.number_input("Dispersion r", value=float(bt["r_on"]) if bt else NB_R, min_value=2.0,
+                                   max_value=200.0, step=1.0, key="lad_r")
+        if st.button("Price the ladder"):
+            entries, bad = parse_ladder_text(text)
+            if not entries:
+                st.error("No ladder lines found. Format: Player Name 1.04 1.25 1.79 3.05 5.50")
+            else:
+                try:
+                    table, tfac = load_tables(ldate)
+                    ldf, linfo = ladder_table(entries, labels[pick], table, tfac, r=ladder_r)
+                    st.session_state["lad"] = {"df": ldf, "info": linfo, "bad": bad, "day": str(ldate), "game": pick}
+                except Exception as exc:
+                    st.error(f"Couldn't price the ladder: {exc}")
+        lad = st.session_state.get("lad")
+        if lad and lad["day"] == str(ldate) and lad["game"] == pick:
+            if lad["bad"]:
+                st.caption("Skipped lines I couldn't read: " + " | ".join(lad["bad"][:4]))
+            if lad["info"]["unmatched"]:
+                st.warning("Couldn't match to a player in this game: " + ", ".join(lad["info"]["unmatched"]))
+            ldf = lad["df"]
+            if not ldf.empty:
+                st.markdown("#### Free bet: the best rungs")
+                st.caption("A free bet returns winnings only, so its value is p x (odds - 1) per £1. That favours longer odds "
+                           "even at fair prices, so the best free-bet rungs are usually the 3+ to 5+ ones. The model's "
+                           "probability is what separates one long shot from another, and it has not been shown to "
+                           "beat bet365. Avoid any 🔴. A value near or above 1.0 means the model is claiming bet365's price "
+                           "is wrong by a lot, which is far more likely to be the model's error.")
+                top = ldf[ldf["Light"] != "🔴"].sort_values("EV free bet", ascending=False).head(5)
+                st.dataframe(top[["Light", "Player", "Rung", "Odds", "Implied %", "Model %", "EV free bet"]],
+                             width="stretch", hide_index=True)
+                st.markdown("#### Every rung")
+                st.dataframe(ldf[["Light", "Player", "Rung", "Odds", "Implied %", "Model %", "Edge (pp)", "EV cash %",
+                                  "EV free bet", "Model mean", "Ladder mean (~)", "Season shots/gp"]],
+                             width="stretch", hide_index=True)
+                st.caption("'Ladder mean' is the shots per game bet365's own prices imply (it reads a little high because "
+                           "the prices include their margin). If it's far from 'Model mean' the model is probably missing "
+                           "a lineup, line or injury change, and the rung goes 🔴. Check the starting lineup first.")
+                st.download_button("Download this check (your paper-trading log)", ldf.assign(Date=lad["day"])
+                                   .to_csv(index=False).encode("utf-8"), file_name=f"nhl_ladder_{lad['day']}.csv",
+                                   mime="text/csv")
+    st.markdown("#### Settle an earlier log")
+    up = st.file_uploader("Upload a log you downloaded above", type="csv", key="lad_up")
+    if up is not None and st.button("Settle with box scores"):
+        try:
+            settled = settle_ladder(pd.read_csv(up), cached_box)
+            st.session_state["lad_settled"] = settled
+        except Exception as exc:
+            st.error(f"Couldn't settle the log: {exc}")
+    settled = st.session_state.get("lad_settled")
+    if settled is not None:
+        summ = ladder_summary(settled)
+        if summ.empty:
+            st.info("Nothing to settle yet: those games haven't finished or no rungs were readable.")
+        else:
+            st.dataframe(summ, width="stretch", hide_index=True)
+            st.caption("'Hit %' vs 'Model said %' and 'Price implied %': if the model is better than bet365's prices, hit "
+                       "rate should track what the model said, not what the price implied. It takes a couple of hundred "
+                       "rungs to tell. Void = the player didn't play; pending = game unfinished.")
+            st.dataframe(settled[["Player", "Rung", "Odds", "Model %", "Shots", "Result", "P/L cash (1u)",
+                                  "P/L free bet (1u)"]], width="stretch", hide_index=True)
+

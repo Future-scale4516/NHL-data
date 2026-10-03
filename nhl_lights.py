@@ -27,7 +27,7 @@ LIGHT_CONFIG = {
     "Moneyline":     {"edge_min": 3.0, "edge_green_max": 6.0, "edge_red": 8.0,  "q_lo": 0.36},
     "Puck line":     {"edge_min": 3.0, "edge_green_max": 6.0, "edge_red": 8.0,  "q_lo": 0.22},
     "Total":         {"edge_min": 4.0, "edge_green_max": 8.0, "edge_red": 11.0, "q_lo": 0.33},
-    "Shots on goal": {"edge_min": 4.0, "edge_green_max": 8.0, "edge_red": 12.0, "q_lo": 0.15},
+    "Shots on goal": {"edge_min": 4.0, "edge_green_max": 8.0, "edge_red": 12.0, "q_lo": 0.08},
 }
 EARLY_SEASON_GP = 40
 MIN_CONSENSUS_BOOKS = 2

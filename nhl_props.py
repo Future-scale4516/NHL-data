@@ -299,3 +299,122 @@ def props_selections(items: list, table: pd.DataFrame, tfac: dict, r: float = NB
                     "Edge vs market (pp)": round(edge_cons, 1) if edge_cons is not None else None,
                     "EV %": round((p_sel * best["price"] - 1) * 100, 1), "Light": light, "Why": why})
     return pd.DataFrame(recs), {"unmatched": sorted(unmatched), "props": n_props}
+
+
+# ---------- bet365-style "X or more shots" ladders (typed in by hand: bet365 is not in the odds feed) ----------
+ROLE_GAP_SHOTS = 0.6     # model mean vs the ladder's own implied mean: bigger gap = probably a role/lineup change
+
+
+def parse_ladder_text(text: str):
+    """
+    Lines like 'Andrei Svechnikov 1.04 1.25 1.79 3.05 5.50' (name, then prices for 1+, 2+, 3+, ...).
+    Returns ([(name, [prices])], [unparseable lines]).
+    """
+    entries, bad = [], []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        toks = line.replace(",", " ").replace(":", " ").split()
+        i = len(toks)
+        while i > 0 and re.fullmatch(r"\d+(?:\.\d+)?", toks[i - 1]):
+            i -= 1
+        name, prices = " ".join(toks[:i]).strip(), [float(t) for t in toks[i:]]
+        if name and prices and all(p > 1.0 for p in prices):
+            entries.append((name, prices))
+        else:
+            bad.append(line)
+    return entries, bad
+
+
+def ladder_implied_mean(prices: list) -> float:
+    """Mean shots implied by the ladder: sum of P(X>=k), plus a geometric tail beyond the last rung. Raw prices
+    include the bookmaker's margin, so this reads a little high."""
+    p = [1 / x for x in prices]
+    tail = 0.0
+    if len(p) >= 2 and 0 < p[-1] < p[-2]:
+        rho = p[-1] / p[-2]
+        tail = p[-1] * rho / (1 - rho)
+    return float(sum(p) + tail)
+
+
+def ladder_table(entries: list, game: dict, table: pd.DataFrame, tfac: dict, r: float = NB_R,
+                 opp_weight: float = OPP_WEIGHT):
+    """Prices every rung of every typed ladder. Returns (DataFrame, {'unmatched': [...]})."""
+    from nhl_lights import assign_light, RED
+
+    lg = league_spm(table)
+    recs, unmatched = [], []
+    for name, prices in entries:
+        row = match_player(name, (game["home"], game["away"]), table)
+        if row is None:
+            unmatched.append(name)
+            continue
+        opp = game["away"] if row["team"] == game["home"] else game["home"]
+        mu = live_mu(row, lg, tfac.get(opp, 1.0), opp_weight)
+        book_mean = ladder_implied_mean(prices)
+        gap = mu - book_mean
+        gp = row["gp_cur"] + row["gp_pri"]
+        season = (row["shots_cur"] + row["shots_pri"]) / gp if gp else float("nan")
+        for k, price in enumerate(prices, start=1):
+            p_m = float(p_over(mu, k - 0.5, r))                      # P(shots >= k)
+            edge = (p_m - 1 / price) * 100
+            light, why = assign_light("Shots on goal", p_m, edge, None, None)
+            if light != "⚪" and abs(gap) >= ROLE_GAP_SHOTS:
+                light = RED
+                why = (f"model expects {mu:.1f} shots but the ladder implies about {book_mean:.1f}: usually a role, "
+                       "line or injury change the model can't see")
+            recs.append({"Game ID": game["id"], "Game": f"{game['away']} @ {game['home']}", "Player": row["name"],
+                         "Player ID": int(row["player_id"]), "Team": row["team"], "Rung": f"{k}+", "k": k,
+                         "Odds": price, "Implied %": round(100 / price, 1), "Model %": round(p_m * 100, 1),
+                         "Edge (pp)": round(edge, 1), "EV cash %": round((p_m * price - 1) * 100, 1),
+                         "EV free bet": round(p_m * (price - 1), 3), "Light": light, "Why": why,
+                         "Model mean": round(mu, 2), "Ladder mean (~)": round(book_mean, 2),
+                         "Season shots/gp": round(season, 2)})
+    return pd.DataFrame(recs), {"unmatched": unmatched}
+
+
+def settle_ladder(df: pd.DataFrame, fetch_box) -> pd.DataFrame:
+    """
+    Settle logged ladder rows against real box scores. fetch_box(game_id) -> boxscore payload.
+    won: shots >= rung. lost otherwise. void: player didn't play (stake returned). pending: game not finished.
+    Free-bet P/L assumes the stake is not returned (win = odds - 1, loss = 0).
+    """
+    from nhl_goalies import parse_skaters
+
+    boxes, out = {}, df.copy()
+    res, shots, pl_cash, pl_free = [], [], [], []
+    for _, r in out.iterrows():
+        gid = int(r["Game ID"])
+        if gid not in boxes:
+            try:
+                payload = fetch_box(gid)
+                final = payload.get("gameState") in ("OFF", "FINAL")
+                boxes[gid] = (final, {s["player_id"]: s["sog"] for s in parse_skaters(payload)})
+            except Exception:
+                boxes[gid] = (False, {})
+        final, sog = boxes[gid]
+        if not final:
+            res.append("pending"); shots.append(None); pl_cash.append(0.0); pl_free.append(0.0)
+        elif int(r["Player ID"]) not in sog:
+            res.append("void"); shots.append(None); pl_cash.append(0.0); pl_free.append(0.0)
+        else:
+            n = sog[int(r["Player ID"])]
+            won = n >= int(r["k"])
+            res.append("won" if won else "lost"); shots.append(n)
+            pl_cash.append(r["Odds"] - 1 if won else -1.0); pl_free.append(r["Odds"] - 1 if won else 0.0)
+    out["Result"], out["Shots"], out["P/L cash (1u)"], out["P/L free bet (1u)"] = res, shots, pl_cash, pl_free
+    return out
+
+
+def ladder_summary(settled: pd.DataFrame) -> pd.DataFrame:
+    """Hit rate vs what the model and the price each implied, overall and by rung."""
+    d = settled[settled["Result"].isin(["won", "lost"])]
+    rows = []
+    for label, g in [("All rungs", d)] + [(f"{k}+", d[d["k"] == k]) for k in sorted(d["k"].unique())]:
+        if g.empty:
+            continue
+        rows.append({"Rungs": label, "n": len(g), "Hit %": round((g["Result"] == "won").mean() * 100, 1),
+                     "Model said %": round(g["Model %"].mean(), 1), "Price implied %": round(g["Implied %"].mean(), 1),
+                     "Cash ROI %": round(g["P/L cash (1u)"].sum() / len(g) * 100, 1)})
+    return pd.DataFrame(rows)
