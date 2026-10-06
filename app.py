@@ -9,8 +9,8 @@ st.caption("A goals model for NHL game bets and shots-on-goal props, checked aga
            "that default to 'no bet'. Pick a date in the sidebar (it carries across pages), then:")
 st.markdown("""
 - **🎯 Game Bets** — Money Line, Puck Line and Totals vs the UK books, a 'Most Likely' tab and an accumulator builder
-- **🎰 Player Props** — shots on goal, including a checker for bet365's 'X or more' ladders
-- **📊 Backtest** — calibration, settings sweep and the goalie test on last season
+- **🎰 Player Props** — shots on goal: prop edges against the US books, and a 'Most Likely' view of who's expected to shoot most
+- **📊 Backtest** — calibration, settings sweep, the goalie test and the shots-on-goal prop backtest on last season
 - **📋 Results** — how past picks actually turned out, with priced-up reconstructions
 - **📋 Suggested Bets** — a capped, flat-staked list from the lights, with live status
 - **📈 CLV** — whether the market moves toward the model's picks

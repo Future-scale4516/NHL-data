@@ -291,3 +291,11 @@ def get_scoreboard(day: str) -> list[dict]:
                         "home_score": h.get("score"), "away_score": a.get("score"),
                         "last_period": (g.get("gameOutcome") or {}).get("lastPeriodType", "REG")})
     return out
+
+
+def fetch_player_game_log(player_id: int, season_id: str, game_type: int = 2) -> list[dict]:
+    """A skater's games this season, newest first: [{'date', 'shots'}]. One call per player."""
+    payload = _get_json(f"{NHL_API_BASE}/player/{player_id}/game-log/{season_id}/{game_type}")
+    out = [{"date": g.get("gameDate"), "shots": g.get("shots")} for g in payload.get("gameLog", [])
+           if g.get("shots") is not None]
+    return sorted(out, key=lambda x: x["date"] or "", reverse=True)

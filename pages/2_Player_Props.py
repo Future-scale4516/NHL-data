@@ -1,26 +1,22 @@
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from datetime import date
+from nhl_ui import setup_page, sidebar_date, render_pick_card, sort_picker, uk_time
 from common import get_api_key, cached_odds
-from nhl_data import get_completed_games_range, get_games, get_boxscore
-from nhl_live import load_slate
-from nhl_goalies import fetch_boxscores
-from nhl_backtest import calibration, season_start_year
-from nhl_ui import nhl_today
-from nhl_lights import GREEN, AMBER, RED, NONE, LIGHT_CONFIG
-from nhl_props import (NB_R, sog_backtest, fetch_stats_table, player_table, team_factors, props_selections,
-                       parse_ladder_text, ladder_table, settle_ladder, ladder_summary)
+from nhl_data import get_games, fetch_player_game_log
+from nhl_backtest import season_start_year
+from nhl_lights import GREEN, AMBER, RED, NONE
+from nhl_props import (NB_R, fetch_stats_table, player_table, team_factors, props_selections, likely_players,
+                       form_streak)
 from odds import fetch_event_props, match_event, COST_LOG
 
-st.set_page_config(page_title="NHL Model - Shots on goal", layout="centered")
-st.title("🏒 Shots on goal")
-st.caption("Per player: shots per minute (regressed toward his position's average) x recent ice time x how many shots "
-           "the opponent allows, then a negative binomial for P(over a line). The calibration tab checks it against "
-           "real box scores for free. It has NOT been compared with historical prices, so treat live edges as "
-           "paper-trade only. **bet365 isn't in the odds feed, and the feed carries NHL player props from US books only "
-           "(DraftKings, FanDuel and others).** Those are used as the market reference: you can't bet them from the UK, "
-           "but they show whether bet365's price is out of line.")
+setup_page("NHL Model — Player Props")
+sel_date = sidebar_date()
+
+FORM_GAMES = 5
+
+st.title("🎰 Player Props")
+st.caption("Shots on goal for now. Explore prop edges (best value against the market) and the most-likely view.")
+st.divider()
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -40,13 +36,13 @@ def cached_games(day_iso):
     return get_games(day_iso)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_box(game_id):
-    return get_boxscore(game_id)
+@st.cache_data(ttl=10800, show_spinner=False)          # 3 hours, like the MLB form lookups
+def cached_log(player_id, season_id):
+    return fetch_player_game_log(player_id, season_id)
 
 
 def load_tables(day):
-    """Skater table (this + last season) and opponent shot-suppression factors."""
+    """Skater table (this + last season) and the opponent shot-suppression factors."""
     y = season_start_year(day)
     table = player_table(cached_stats("skater/summary", f"{y}{y + 1}"), cached_stats("skater/summary", f"{y - 1}{y}"))
     try:
@@ -56,253 +52,196 @@ def load_tables(day):
     return table, tfac
 
 
-live_tab, ladder_tab, cal_tab = st.tabs(["Live props", "bet365 ladder", "Calibration backtest"])
+def dispersion():
+    bt = st.session_state.get("sog_bt")                 # fitted on the Backtest page when it has been run
+    return float(bt["r_on"]) if bt else NB_R
 
-with cal_tab:
-    st.caption("Replays a whole season of box scores through the model, using only earlier games for every prediction. "
-               "Fetches about 1,300 box scores (throttled; shared with the goalie test, so a re-run only retries "
-               "failures). Naive = always predicting the base rate of that line for the player's position.")
-    y0 = st.selectbox("Season", [2025, 2024], format_func=lambda y: f"{y}-{str(y + 1)[2:]}")
-    if st.button("Run shots-on-goal backtest"):
-        bar = st.progress(0.0, text="Fetching box scores...")
+
+def player_form(player_id, line):
+    """(hits, played, symbols) over the last games this season, or None when the lookup fails (never breaks the list)."""
+    try:
+        y = season_start_year(sel_date)
+        hits, played, syms = form_streak(cached_log(int(player_id), f"{y}{y + 1}"), line, FORM_GAMES)
+        return (hits, played, syms) if played else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- Player Prop Edges
+st.markdown("## 🎰 Player Prop Edges")
+st.caption("Pulls the US books' shots-on-goal props per game (the only source the odds provider has: it carries no UK "
+           "prices for them), estimates each player's probability with the opponent's shot suppression factored in, "
+           "and surfaces green/amber value. The US prices are the market reference: you can't bet there from the UK, "
+           "so check the price at your own bookmaker before betting. Each game analysed costs 1 quota credit.")
+pc1, pc2 = st.columns([2, 3])
+with pc1:
+    prop_max_games = st.slider("Games to analyse (1 credit each)", 1, 15, 8)
+with pc2:
+    st.caption(f"Projected cost: up to {prop_max_games} credits. Cached 15 min, so re-viewing the same games is free. "
+               "The US books usually post these lines a few hours before the game.")
+
+if st.button("Find player prop edges (US books)"):
+    api_key = get_api_key()
+    if not api_key:
+        st.error("No Odds API key found in secrets.")
+        st.stop()
+    with st.spinner("Pulling props, player stats and opponent factors..."):
         try:
-            games = get_completed_games_range(date(y0, 10, 1), date(y0 + 1, 4, 30))
-            _, skl, failed = fetch_boxscores(games, progress=lambda f: bar.progress(min(f, 1.0)))
-            if skl.empty:
-                raise RuntimeError("No skater rows could be read from the box scores. "
-                                   + (f"Example: {next(iter(failed.values()))[:260]}" if failed else ""))
-            bar.progress(1.0, text="Scoring the model...")
-            res = sog_backtest(skl)
-            res["failed"] = len(failed)
-            res["first_error"] = next(iter(failed.values()), None)
-            res["games"] = len(games)
-            st.session_state["sog_bt"] = res
-        except Exception as exc:
-            st.error(f"Backtest failed: {exc}")
-        bar.empty()
-    bt = st.session_state.get("sog_bt")
-    if bt:
-        st.caption(f"{bt['n_rows']:,} player-games from {bt['games'] - bt['failed']} of {bt['games']} games. "
-                   f"Fitted dispersion r = {bt['r_on']:.1f} (set it under Live props).")
-        if bt["failed"]:
-            st.warning(f"⚠ {bt['failed']} box score(s) could not be fetched (e.g. {bt['first_error'][:140]}). Click "
-                       "again: games already fetched are remembered.")
-        s = bt["summary"]
-        st.markdown("#### Calibration and skill (opponent factor on)")
-        st.dataframe(s[s["variant"] == "opponent factor on"].drop(columns="variant"), width="stretch", hide_index=True)
-        st.caption("'vs naive': Brier minus the always-predict-the-base-rate Brier, so negative = the model adds "
-                   "information. 'model avg' should sit on 'base rate'. Halves show whether it holds all season.")
-        st.markdown("#### Does the opponent shot-suppression factor help?")
-        oc = bt["opp_compare"]
-        st.dataframe(oc, width="stretch", hide_index=True)
-        helps = int((oc["95% CI high"] < 0).sum())
-        if helps >= 2:
-            st.success(f"Yes: it improves the Brier score at {helps} of {len(oc)} lines (interval below zero). Keep "
-                       "OPP_WEIGHT = 1.")
-        else:
-            st.info("No clear gain from the opponent factor. Consider setting OPP_WEIGHT to 0 in nhl_props.py.")
-        f = bt["frame"].assign(y25=lambda d: d["sog"] > 2.5)
-        c = calibration(f, "p25", "y25")
-        if c and c["buckets"]:
-            cdf = pd.DataFrame(c["buckets"], columns=["Predicted band", "Players", "Model avg %", "Actual %"])
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=[0, 100], y=[0, 100], mode="lines", line=dict(dash="dash", color="#888"), name="Perfect"))
-            fig.add_trace(go.Scatter(x=cdf["Model avg %"], y=cdf["Actual %"], mode="markers+lines", name="Model"))
-            fig.update_layout(height=300, title="P(3+ shots): predicted vs actual", xaxis_title="Model %",
-                              yaxis_title="Actual %", margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig, width="stretch")
-
-with live_tab:
-    day = st.date_input("Date (NHL game date)", value=nhl_today(), key="sog_day")
-    r_disp = st.number_input("Dispersion r", value=float(bt["r_on"]) if bt else NB_R, min_value=2.0, max_value=200.0,
-                             step=1.0, help="Lower = fatter tails. The calibration backtest fits it.")
-    st.caption("These are the **US books'** shots-on-goal lines (the only source the odds provider has), shown as the market "
-               "reference: the best price and consensus are not bettable from the UK. For bet365's own prices use the "
-               "bet365 ladder tab. Costs about 1 Odds API credit per game that has props (cached for 15 minutes). The US "
-               "books usually post them a few hours before the game.")
-    if st.button("Load props"):
-        api_key = get_api_key()
-        if not api_key:
-            st.error("No Odds API key found in secrets.")
-            st.stop()
-        with st.spinner("Loading slate, player stats and props..."):
-            try:
+            games = sorted(cached_games(str(sel_date)), key=lambda g: g["start_utc"] or "")
+            if not games:
+                st.session_state.pop("sog_edges", None)
+                st.warning(f"No games found for {sel_date}.")
+            else:
                 try:
                     events = cached_odds(api_key)
                 except Exception as exc:
                     events = []
                     st.warning(f"Odds unavailable: {exc}")
-                rows, warns = load_slate(day, events)
-                y = season_start_year(day)
-                table = player_table(cached_stats("skater/summary", f"{y}{y + 1}"),
-                                     cached_stats("skater/summary", f"{y - 1}{y}"))
-                try:
-                    tfac = team_factors(cached_stats("team/summary", f"{y}{y + 1}"), cached_stats("team/summary", f"{y - 1}{y}"))
-                except Exception:
-                    tfac = {}
+                table, tfac = load_tables(sel_date)
                 COST_LOG.clear()
                 items, errs = [], []
-                for g in rows:
-                    if not g.get("event_id"):
+                for g in games:
+                    if len(items) >= prop_max_games:
+                        break
+                    ev = match_event(events, g["home"], g["away"], g["start_utc"])
+                    if ev is None:
                         continue
                     try:
-                        items.append((g, cached_props(api_key, g["event_id"])))
+                        items.append((g, cached_props(api_key, ev["id"])))
                     except Exception as exc:
                         errs.append(f"{g['away']} @ {g['home']}: {exc}")
-                sel, info = props_selections(items, table, tfac, r=r_disp)
-                st.session_state["sog"] = {"sel": sel, "info": info, "day": str(day), "warns": warns, "errs": errs,
-                                           "games": len(rows), "tfac": bool(tfac),
-                                           "credits": sum(m["last"] for m in COST_LOG),
-                                           "remaining": COST_LOG[-1]["remaining"] if COST_LOG else None}
-            except Exception as exc:
-                st.error(f"Couldn't load props: {exc}")
-    sg = st.session_state.get("sog")
-    if sg and sg["day"] == str(day):
-        for w in sg["warns"]:
-            st.warning(w)
-        if sg["errs"]:
-            st.warning("Some games' props failed to load: " + "; ".join(sg["errs"])[:300])
-        if not sg["tfac"]:
-            st.caption("Opponent shot-suppression data unavailable, so no opponent adjustment was applied.")
-        if sg["credits"]:
-            st.caption(f"Odds API: this run used ~{sg['credits']} credits, {sg['remaining']} remaining.")
-        sel = sg["sel"]
-        if sel.empty:
-            st.info(f"No US shots-on-goal prices found for {sg['games']} game(s) yet. The US books usually post them a few "
-                    "hours before the game, so try again closer to the start.")
-        else:
-            n = sel["Light"].value_counts()
-            st.caption(f"{n.get(GREEN, 0)} 🟢 · {n.get(AMBER, 0)} 🟡 · {n.get(RED, 0)} 🔴 · {n.get(NONE, 0)} ⚪ across "
-                       f"{sel['Game ID'].nunique()} game(s); {sg['info']['props']} player lines")
-            if sg["info"]["unmatched"]:
-                st.caption(f"Couldn't match {len(sg['info']['unmatched'])} name(s) to the stats table: "
-                           + ", ".join(sg["info"]["unmatched"][:8]))
-            cfg = LIGHT_CONFIG["Shots on goal"]
-            lights = st.multiselect("Lights", [GREEN, AMBER, RED, NONE], default=[GREEN, AMBER, RED])
-            st.caption(f"Provisional rules: edge from {cfg['edge_min']:g}pp, green up to {cfg['edge_green_max']:g}, red from "
-                       f"{cfg['edge_red']:g}, and a multi-book consensus is required for green. Not yet validated "
-                       "against historical prices.")
-            show = sel[sel["Light"].isin(lights)].copy()
-            order = {GREEN: 0, AMBER: 1, RED: 2, NONE: 3}
-            show["_o"] = show["Light"].map(order)
-            show["_e"] = show["Edge vs market (pp)"].fillna(show["Edge (pp)"])
-            show = show.sort_values(["_o", "_e"], ascending=[True, False])
-            cols = ["Light", "Selection", "Game", "Model mean", "Model %", "Odds", "Book", "Market %", "Books",
-                    "Edge vs market (pp)", "EV %"]
-            st.dataframe(show[cols], width="stretch", hide_index=True)
-            st.download_button("Download props CSV", data=sel.to_csv(index=False).encode("utf-8"),
-                               file_name=f"nhl_sog_{sg['day']}.csv", mime="text/csv")
-
-with ladder_tab:
-    st.caption("bet365 isn't in the odds feed, so paste its 'X or more shots' ladder in here (select the rows on bet365, "
-               "copy, paste: the 'last 5' numbers and a name on one line and the prices on the next are all fine). Each "
-               "rung is compared with the **US books' market** for that player when it's available, and with the model "
-               "when it isn't. Log what you check, then settle it against real box scores later: that is the only way to "
-               "find out whether bet365's prices can be beaten.")
-    ldate = st.date_input("Date (NHL game date)", value=nhl_today(), key="lad_day")
-    try:
-        slate_games = cached_games(str(ldate))
-    except Exception as exc:
-        slate_games = []
-        st.warning(f"Couldn't load the schedule: {exc}")
-    if not slate_games:
-        st.info("No games found for that date.")
-    else:
-        labels = {f"{g['away']} @ {g['home']}": g for g in slate_games}
-        pick = st.selectbox("Game", list(labels))
-        text = st.text_area("Paste the ladder (or type one player per line: name, then the prices for 1+, 2+, 3+ ...)",
-                            height=170, key="lad_text",
-                            placeholder="Andrei Svechnikov 1.04 1.25 1.79 3.05 5.50\nOwen Tippett 1.066 1.40 2.30 4.30 8.50")
-        use_us = st.checkbox("Benchmark against the US books' market (about 1 credit)", value=True, key="lad_us",
-                             help="Fetches the US books' shots-on-goal lines for this game and measures bet365's prices "
-                                  "against what they imply for each player. Cached for 15 minutes.")
-        ladder_r = st.number_input("Dispersion r", value=float(bt["r_on"]) if bt else NB_R, min_value=2.0,
-                                   max_value=200.0, step=1.0, key="lad_r")
-        if st.button("Price the ladder"):
-            entries, bad = parse_ladder_text(text)
-            if not entries:
-                st.error("No ladder lines found. Format: Player Name 1.04 1.25 1.79 3.05 5.50")
-            else:
-                try:
-                    table, tfac = load_tables(ldate)
-                    us_event, us_note = None, ""
-                    if use_us:
-                        api_key = get_api_key()
-                        if not api_key:
-                            us_note = "No Odds API key found, so the US benchmark was skipped."
-                        else:
-                            try:
-                                g = labels[pick]
-                                ev = match_event(cached_odds(api_key), g["home"], g["away"], g["start_utc"])
-                                if ev is None:
-                                    us_note = "The odds provider doesn't list this game yet, so there's no US benchmark."
-                                else:
-                                    us_event = cached_props(api_key, ev["id"])
-                                    if not us_event.get("bookmakers"):
-                                        us_note = ("The US books haven't posted shots-on-goal lines for this game yet "
-                                                   "(they usually appear a few hours before). Using the model instead.")
-                                        us_event = None
-                            except Exception as exc:
-                                us_note = f"US benchmark unavailable ({exc}). Using the model instead."
-                    ldf, linfo = ladder_table(entries, labels[pick], table, tfac, r=ladder_r, us_event=us_event)
-                    st.session_state["lad"] = {"df": ldf, "info": linfo, "bad": bad, "day": str(ldate), "game": pick,
-                                               "us_note": us_note, "used_us": us_event is not None}
-                except Exception as exc:
-                    st.error(f"Couldn't price the ladder: {exc}")
-        lad = st.session_state.get("lad")
-        if lad and lad["day"] == str(ldate) and lad["game"] == pick:
-            if lad["bad"]:
-                st.caption("Skipped lines I couldn't read: " + " | ".join(lad["bad"][:4]))
-            if lad["info"]["unmatched"]:
-                st.warning("Couldn't match to a player in this game: " + ", ".join(lad["info"]["unmatched"]))
-            if lad.get("us_note"):
-                st.warning(lad["us_note"])
-            elif lad.get("used_us"):
-                st.caption(f"US benchmark found for {lad['info']['us_players']} of {lad['df']['Player'].nunique()} "
-                           "player(s); the rest use the model.")
-            ldf = lad["df"]
-            if not ldf.empty:
-                st.markdown("#### Free bet: the best rungs")
-                st.caption("A free bet returns winnings only, so its value is p x (odds - 1) per £1. That favours longer odds "
-                           "even at fair prices, so the best free-bet rungs are usually the 3+ to 5+ ones. The model's "
-                           "probability is what separates one long shot from another. Where the US books' lines are "
-                           "available the probability comes from them (a real market); otherwise from our model, which "
-                           "has not been shown to beat bet365. Avoid any 🔴. A value near or above 1.0 means the price "
-                           "looks badly wrong, which is far more likely to be an error on our side or a lineup change.")
-                top = ldf[ldf["Light"] != "🔴"].sort_values("EV free bet", ascending=False).head(5)
-                st.dataframe(top[["Light", "Player", "Rung", "Odds", "Implied %", "US market %", "Model %", "EV free bet", "Basis"]],
-                             width="stretch", hide_index=True)
-                st.markdown("#### Every rung")
-                st.dataframe(ldf[["Light", "Player", "Rung", "Odds", "Implied %", "US market %", "Model %", "Edge (pp)",
-                                  "Basis", "EV cash %", "EV free bet", "US mean (~)", "Model mean", "Ladder mean (~)",
-                                  "Season shots/gp"]],
-                             width="stretch", hide_index=True)
-                st.caption("'Edge' is measured against the US market when available ('Basis'), otherwise against the model. "
-                           "'Ladder mean' is the shots per game bet365's own prices imply (a little high, since prices "
-                           "include their margin). If it's far from the US (or model) mean, either bet365 knows about a "
-                           "lineup, line or injury change or its price is stale, and the rung goes 🔴. Check the starting "
-                           "lineup first.")
-                st.download_button("Download this check (your paper-trading log)", ldf.assign(Date=lad["day"])
-                                   .to_csv(index=False).encode("utf-8"), file_name=f"nhl_ladder_{lad['day']}.csv",
-                                   mime="text/csv")
-    st.markdown("#### Settle an earlier log")
-    up = st.file_uploader("Upload a log you downloaded above", type="csv", key="lad_up")
-    if up is not None and st.button("Settle with box scores"):
-        try:
-            settled = settle_ladder(pd.read_csv(up), cached_box)
-            st.session_state["lad_settled"] = settled
+                sel, info = props_selections(items, table, tfac, r=dispersion())
+                if not sel.empty:
+                    sel["GameLbl"] = sel.apply(lambda r: f"{r['Game']} · {uk_time(r['Start'])}", axis=1)
+                # Stored here and rendered from the persistent block below: touching a Sort dropdown or a checkbox
+                # reruns the page with this button False again, so nothing nested under it would survive.
+                st.session_state["sog_edges"] = {"sel": sel, "info": info, "errs": errs, "n_games": len(games),
+                                                 "credits": sum(m["last"] for m in COST_LOG),
+                                                 "remaining": COST_LOG[-1]["remaining"] if COST_LOG else None}
         except Exception as exc:
-            st.error(f"Couldn't settle the log: {exc}")
-    settled = st.session_state.get("lad_settled")
-    if settled is not None:
-        summ = ladder_summary(settled)
-        if summ.empty:
-            st.info("Nothing to settle yet: those games haven't finished or no rungs were readable.")
-        else:
-            st.dataframe(summ, width="stretch", hide_index=True)
-            st.caption("'Hit %' vs 'Model said %' and 'Price implied %': if the model is better than bet365's prices, hit "
-                       "rate should track what the model said, not what the price implied. It takes a couple of hundred "
-                       "rungs to tell. Void = the player didn't play; pending = game unfinished.")
-            st.dataframe(settled[["Player", "Rung", "Odds", "Model %", "Shots", "Result", "P/L cash (1u)",
-                                  "P/L free bet (1u)"]], width="stretch", hide_index=True)
+            st.session_state.pop("sog_edges", None)
+            st.error(f"Couldn't load props: {exc}")
 
+edges = st.session_state.get("sog_edges")
+if edges:
+    sel, info = edges["sel"], edges["info"]
+    if edges["credits"]:
+        st.caption(f"Quota: this run used ~{edges['credits']} credits, {edges['remaining']} remaining")
+    if edges["errs"]:
+        st.warning("Some games' props failed to load: " + "; ".join(edges["errs"])[:300])
+    if sel.empty:
+        st.info(f"No US shots-on-goal prices found yet for the {edges['n_games']} game(s) on this date. The US books "
+                "usually post them a few hours before the game, so try again closer to the start.")
+    else:
+        n = sel["Light"].value_counts()
+        st.markdown(f"### {GREEN} {n.get(GREEN, 0)} green · {AMBER} {n.get(AMBER, 0)} amber value props")
+        show_all = st.checkbox(f"Also show {RED} suspect and {NONE} no-signal selections", value=False, key="edge_show_all")
+        show_form = st.checkbox(f"Show last-{FORM_GAMES} games form (slower: one lookup per player)", key="edge_form")
+        st.caption("Checks whether each player went over this pick's line in each of his last games this season. Free NHL "
+                   "data, but it's one call per player: the first check each session takes a few seconds, then it's "
+                   "cached for 3 hours.")
+        if info["unmatched"]:
+            st.caption(f"Couldn't match {len(info['unmatched'])} name(s) to the stats table: "
+                       + ", ".join(info["unmatched"][:6]))
+        picked = st.multiselect("Filter by game", sorted(sel["GameLbl"].unique().tolist()), default=[],
+                                key="edge_game_filter", help="Leave empty to show every game.")
+        view = sel[sel["GameLbl"].isin(picked)] if picked else sel
+        if not show_all:
+            view = view[view["Light"].isin([GREEN, AMBER])]
+
+        def show_prop_market(tab, label):
+            with tab:
+                sub = view[view["Market"] == label].copy()
+                if sub.empty:
+                    st.write("No value bets in this market for the chosen filters.")
+                    return
+                sub["_edge"] = sub["Edge vs market (pp)"].fillna(sub["Edge (pp)"])
+                sub = sort_picker(sub, [("Edge (high to low)", "_edge", False), ("Model % (high to low)", "Model %", False),
+                                        ("Odds (high to low)", "Odds", False), ("Start time", "Start", True)],
+                                  key=f"sort_prop_{label}")
+                for _, r in sub.iterrows():
+                    mkt = f"{r['Market %']:.1f}%" if pd.notna(r["Market %"]) else "n/a (1 book)"
+                    metrics = [("Model %", f"{r['Model %']:.1f}%"), ("Market %", mkt),
+                               ("Edge", f"{r['_edge']:+.1f} pts"), ("Best US price", f"{r['Odds']:.2f}")]
+                    detail = f"Model expects {r['Model mean']:.1f} shots" + (
+                        f" · {r['Why']}" if r["Light"] in (AMBER, RED) else "")
+                    if show_form:
+                        f = player_form(r["Key"].split(":")[1], r["Line"])
+                        if f:
+                            metrics.append(("Form", f"{f[0]}/{f[1]} over"))
+                            detail = f"{f[2]}  —  {detail}"
+                    render_pick_card(r["Light"], r["Selection"], r["GameLbl"], metrics, reason=detail,
+                                     conditions=f"{r['Team']} · {int(r['Books'])} US book(s) in the consensus")
+
+        (sog_tab,) = st.tabs(["🏒 Shots on goal"])
+        show_prop_market(sog_tab, "Shots on goal")
+        st.caption(f"{GREEN} edge 4–8 pts over the market · {AMBER} above that, or only one book to check against. "
+                   f"{RED} (12+) and no-signal (<4) are hidden unless you tick the box above. Model %: our probability · "
+                   "Market %: the US books' de-vigged consensus · Best US price: best decimal price across US books. "
+                   "The model has not been compared with real prices: paper-trade until it has.")
+
+# ---------------------------------------------------------------- Most Likely
+st.markdown("## 🔮 Most Likely: players expected to take the most shots")
+st.caption("Ranks skaters by the model's expected shots and their chance of 2+, 3+ and 4+, using this season's rate blended "
+           "with last season's, recent ice time and how many shots tonight's opponent allows. This is the 'most likely' "
+           "lens (it ignores odds): pair it with Player Prop Edges, the 'best value' lens. Free: no odds or quota used. "
+           "The model doesn't know who is injured or scratched, so check the lineups.")
+if st.button("Rank most likely players"):
+    with st.spinner("Reading the slate, player stats and opponents..."):
+        try:
+            games = cached_games(str(sel_date))
+            if not games:
+                st.session_state.pop("sog_likely", None)
+                st.warning(f"No games found for {sel_date}.")
+            else:
+                table, tfac = load_tables(sel_date)
+                ml = likely_players(games, table, tfac, r=dispersion())
+                if not ml.empty:
+                    ml["GameLbl"] = ml.apply(lambda r: f"{r['Game']} · {uk_time(r['Start'])}", axis=1)
+                st.session_state["sog_likely"] = {"df": ml, "tfac": bool(tfac)}
+        except Exception as exc:
+            st.session_state.pop("sog_likely", None)
+            st.error(f"Couldn't rank players: {exc}")
+
+likely = st.session_state.get("sog_likely")
+if likely:
+    ml = likely["df"]
+    if not likely["tfac"]:
+        st.caption("Opponent shot-suppression data unavailable, so no opponent adjustment was applied.")
+    if ml.empty:
+        st.warning("No players found for these games.")
+    else:
+        show_form_ml = st.checkbox(f"Show last-{FORM_GAMES} games form (slower: one lookup per player)", key="ml_form")
+        st.caption(f"Checks whether each player took 3+ shots in each of his last {FORM_GAMES} games this season. Free NHL "
+                   "data, but it's one call per player: the first check each session takes a few seconds, then it's "
+                   "cached for 3 hours.")
+        ml_picked = st.multiselect("Filter by game", sorted(ml["GameLbl"].unique().tolist()), default=[],
+                                   key="ml_game_filter", help="Leave empty to show every game.")
+        if ml_picked:
+            ml = ml[ml["GameLbl"].isin(ml_picked)]
+
+        def show_ml(tab):
+            with tab:
+                sub = sort_picker(ml.copy(), [("Expected shots (high to low)", "Exp shots", False),
+                                              ("3+ shots % (high to low)", "3+ %", False),
+                                              ("Ice time (high to low)", "Exp TOI", False)], key="sort_ml_sog")
+                for _, r in sub.head(40).iterrows():
+                    metrics = [("Exp shots", f"{r['Exp shots']:.2f}"), ("2+", f"{r['2+ %']:.0f}%"),
+                               ("3+", f"{r['3+ %']:.0f}%"), ("4+", f"{r['4+ %']:.0f}%")]
+                    if show_form_ml:
+                        f = player_form(r["Player ID"], 2.5)
+                        if f:
+                            metrics.append(("Form (3+)", f"{f[0]}/{f[1]}  {f[2]}"))
+                    season = (f"Season {r['Season shots/gp']:.1f}/gp ({int(r['GP this season'])} gp)"
+                              if pd.notna(r["Season shots/gp"]) else "No games yet this season")
+                    last = f" · last season {r['Last season shots/gp']:.1f}/gp" if pd.notna(r["Last season shots/gp"]) else ""
+                    opp = f" · {r['Opp']} allow {(r['Opp factor'] - 1) * 100:+.0f}% shots vs league" if r["Opp factor"] != 1 else ""
+                    render_pick_card(None, r["Player"], f"{r['GameLbl']} · {r['Pos']} · ~{r['Exp TOI']:.0f} min",
+                                     metrics, conditions=season + last + opp)
+
+        (ml_tab,) = st.tabs(["🏒 Shots on goal"])
+        show_ml(ml_tab)
+        st.caption("Most likely is not the same as best bet: a player can be very likely yet fairly priced (no value). "
+                   "Cross-reference with Player Prop Edges. Expected shots is the model's mean; the 2+/3+/4+ chances come "
+                   "from it with a negative binomial (shots are more variable than a Poisson). Players with no games yet "
+                   "this season, or under about 11 minutes a night, are left out.")
