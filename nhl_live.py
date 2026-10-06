@@ -7,7 +7,7 @@ so the app, Suggested Bets and Props pages all build selections the same way.
 import pandas as pd
 
 from nhl_data import get_standings, get_prior_standings, compute_team_strengths, get_games
-from model import run_game_model
+from model import run_game_model, score_matrix, totals_probs
 from odds import match_event, best_prices, fair_probs
 from nhl_lights import assign_light
 
@@ -73,8 +73,12 @@ def selections(rows: list[dict]) -> pd.DataFrame:
             edge_cons = (mp - cons[0]) * 100 if cons and cons[1] >= 2 else None   # a 1-book "consensus" isn't one
             light, why = assign_light(market, mp, edge_cons if edge_cons is not None else edge_best,
                                       cons[1] if cons else None, g.get("min_gp"))
+            r = g["result"]
+            reason = (f"Model total xG {r['home_exp_goals'] + r['away_exp_goals']:.2f} vs line {line:g}"
+                      if market == "Total" else
+                      f"Model xG: {g['home']} {r['home_exp_goals']} – {r['away_exp_goals']} {g['away']}")
             recs.append({
-                "Game ID": g["id"], "Game": f"{g['away']} @ {g['home']}", "Start": g["start_utc"],
+                "Reason": reason, "Game ID": g["id"], "Game": f"{g['away']} @ {g['home']}", "Start": g["start_utc"],
                 "Home": g["home"], "Away": g["away"], "Market": market, "Selection": label, "Line": line,
                 "Key": key, "Model %": round(mp * 100, 1), "Odds": price, "Book": book,
                 "Implied %": round(100 / price, 1), "Edge (pp)": round(edge_best, 1),
@@ -82,4 +86,26 @@ def selections(rows: list[dict]) -> pd.DataFrame:
                 "Edge vs market (pp)": round(edge_cons, 1) if edge_cons is not None else None,
                 "EV %": round((mp * price - 1) * 100, 1), "Min GP": g.get("min_gp"),
                 "Light": light, "Why": why})
+    return pd.DataFrame(recs)
+
+
+LIKELY_TOTAL_LINES = (5.5, 6.5)
+
+
+def likely_table(rows: list[dict]) -> pd.DataFrame:
+    """Model-only confidence for every selection, ignoring odds entirely (works before any prices are posted)."""
+    recs = []
+    for g in rows:
+        r, h, a = g["result"], g["home"], g["away"]
+        ml, pl = r["moneyline"], r["puck_line"]
+        m = score_matrix(r["home_exp_goals"], r["away_exp_goals"])
+        sels = [("Moneyline", f"{h} ML", ml["home_win_prob"]), ("Moneyline", f"{a} ML", ml["away_win_prob"]),
+                ("Puck line", f"{h} -1.5", pl["home_-1.5"]), ("Puck line", f"{a} +1.5", pl["away_+1.5"]),
+                ("Puck line", f"{a} -1.5", pl["away_-1.5"]), ("Puck line", f"{h} +1.5", pl["home_+1.5"])]
+        for line in LIKELY_TOTAL_LINES:
+            t = totals_probs(m, line)
+            sels += [("Total", f"Over {line:g}", t["over"]), ("Total", f"Under {line:g}", t["under"])]
+        for market, label, p in sels:
+            recs.append({"Game ID": g["id"], "Game": f"{a} @ {h}", "Start": g["start_utc"], "Market": market,
+                         "Selection": label, "Model %": round(p * 100, 1)})
     return pd.DataFrame(recs)

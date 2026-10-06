@@ -6,6 +6,7 @@ from nhl_live import load_slate, selections
 from nhl_bets import pick_bets, build_doubles, settle, pnl, DEFAULT_TRUST, AMBER_STAKE_FACTOR
 from nhl_lights import GREEN, AMBER, RED, NONE
 from nhl_data import get_scoreboard
+from nhl_ui import nhl_today, uk_time
 
 st.set_page_config(page_title="NHL Model - Suggested Bets", layout="centered")
 st.title("🎯 Suggested Bets")
@@ -15,7 +16,7 @@ st.warning("**Paper-trade first.** On last season the model matched the base rat
            "lose, and only after the CLV evidence says the model earns it.")
 
 c1, c2, c3 = st.columns(3)
-day = c1.date_input("Date", value=date.today(), key="sb_day")
+day = c1.date_input("Date (NHL game date)", value=nhl_today(), key="sb_day")
 bankroll = c2.number_input("Bankroll (£)", value=1000.0, min_value=0.0, step=100.0)
 unit_pct = c3.slider("Unit = % of bankroll", 0.1, 1.0, 0.5, 0.1,
                      help="1 unit is this % of the bankroll. Stakes are multiples of a unit.")
@@ -64,8 +65,7 @@ if sb and sb["day"] == str(day):
             if len(blocked):
                 st.caption("What blocked the near-misses: " + " · ".join(f"{k} ({v})" for k, v in blocked.items()))
         else:
-            show = picks.assign(Kickoff=picks["Start"].map(
-                lambda s: datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%H:%M UTC") if s else ""))
+            show = picks.assign(Kickoff=picks["Start"].map(uk_time))
             cols = ["Light", "Game", "Kickoff", "Selection", "Odds", "Book", "Model %", "Market %", "Units", "Stake"]
             st.dataframe(show[cols], width="stretch", hide_index=True,
                          column_config={"Stake": st.column_config.NumberColumn("Stake (£)", format="£%.2f")})

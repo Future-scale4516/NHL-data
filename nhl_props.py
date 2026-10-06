@@ -305,23 +305,41 @@ def props_selections(items: list, table: pd.DataFrame, tfac: dict, r: float = NB
 ROLE_GAP_SHOTS = 0.6     # model mean vs the ladder's own implied mean: bigger gap = probably a role/lineup change
 
 
+_NUM = re.compile(r"\d+(?:\.\d+)?")
+
+
 def parse_ladder_text(text: str):
     """
-    Lines like 'Andrei Svechnikov 1.04 1.25 1.79 3.05 5.50' (name, then prices for 1+, 2+, 3+, ...).
-    Returns ([(name, [prices])], [unparseable lines]).
+    Accepts either one line per player ('Andrei Svechnikov 1.04 1.25 1.79 3.05 5.50') or what you get from
+    copy-pasting bet365's page: a name line, a line of small whole numbers (the 'last 5' shot counts, ignored),
+    then a line of prices. Prices always carry a decimal point; whole numbers are treated as 'last 5'.
+    Returns ([(name, [prices for 1+, 2+, 3+ ...])], [lines that couldn't be read]).
     """
-    entries, bad = [], []
+    entries, bad, pending, current = [], [], None, None
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line:
             continue
-        toks = line.replace(",", " ").replace(":", " ").split()
+        toks = re.sub(r":\s", " ", line).replace(",", " ").split()
         i = len(toks)
-        while i > 0 and re.fullmatch(r"\d+(?:\.\d+)?", toks[i - 1]):
+        while i > 0 and _NUM.fullmatch(toks[i - 1]):
             i -= 1
-        name, prices = " ".join(toks[:i]).strip(), [float(t) for t in toks[i:]]
-        if name and prices and all(p > 1.0 for p in prices):
-            entries.append((name, prices))
+        name, nums = " ".join(toks[:i]).strip(), toks[i:]
+        if not nums:                                   # a name line: hold it for the prices that follow
+            pending, current = name or pending, None
+            continue
+        if all("." not in t for t in nums):            # 'last 5' counts or a '1 2 3 4 5' header: skip, keep the name
+            pending, current = name or pending, None
+            continue
+        prices = [float(t) for t in nums]
+        who = name or pending
+        if not all(p > 1.0 for p in prices):
+            bad.append(line)
+        elif who:
+            entries.append((who, prices))
+            pending, current = None, len(entries) - 1
+        elif current is not None:                      # more prices for the same player (one price per line when pasted)
+            entries[current] = (entries[current][0], entries[current][1] + prices)
         else:
             bad.append(line)
     return entries, bad
@@ -338,13 +356,60 @@ def ladder_implied_mean(prices: list) -> float:
     return float(sum(p) + tail)
 
 
+def consensus_lines(event: dict) -> dict:
+    """{(player name as the book writes it, line): (fair P(over), number of books)}: de-vigged, averaged over the books
+    that quote both sides of that exact line."""
+    from odds import props_table
+
+    pt = props_table(event)
+    out = {}
+    if pt.empty:
+        return out
+    for (player, line), grp in pt.groupby(["player", "line"]):
+        fair = []
+        for _, bk in grp.groupby("book"):
+            ov, un = bk[bk["side"] == "over"]["price"], bk[bk["side"] == "under"]["price"]
+            if len(ov) and len(un):
+                io, iu = 1 / ov.iloc[0], 1 / un.iloc[0]
+                if io + iu >= 0.97:
+                    fair.append(io / (io + iu))
+        if fair:
+            out[(player, float(line))] = (float(np.mean(fair)), len(fair))
+    return out
+
+
+def us_markets(event: dict, game: dict, table: pd.DataFrame) -> dict:
+    """{player_id: [(line, fair P(over), books), ...]} from the US books' posted lines for this game."""
+    res = {}
+    for (player, line), (p, n) in consensus_lines(event).items():
+        row = match_player(player, (game["home"], game["away"]), table)
+        if row is not None:
+            res.setdefault(int(row["player_id"]), []).append((line, p, n))
+    return res
+
+
+def market_mu(lines: list, r: float = NB_R) -> float:
+    """The mean shots whose negative binomial best reproduces the market's posted P(over) at each line."""
+    from scipy.optimize import minimize_scalar
+
+    def loss(mu):
+        return sum(n * (float(p_over(mu, L, r)) - p) ** 2 for L, p, n in lines)
+
+    return float(minimize_scalar(loss, bounds=(0.05, 12.0), method="bounded").x)
+
+
 def ladder_table(entries: list, game: dict, table: pd.DataFrame, tfac: dict, r: float = NB_R,
-                 opp_weight: float = OPP_WEIGHT):
-    """Prices every rung of every typed ladder. Returns (DataFrame, {'unmatched': [...]})."""
+                 opp_weight: float = OPP_WEIGHT, us_event: dict = None):
+    """
+    Prices every rung of every typed ladder. If the US books' shots-on-goal event is supplied, each player's
+    market-implied mean is fitted to their posted lines and the edge is measured against THAT (a real market), not
+    just against our model. Returns (DataFrame, {'unmatched': [...], 'us_players': n}).
+    """
     from nhl_lights import assign_light, RED
 
     lg = league_spm(table)
-    recs, unmatched = [], []
+    us = us_markets(us_event, game, table) if us_event else {}
+    recs, unmatched, us_found = [], [], 0
     for name, prices in entries:
         row = match_player(name, (game["home"], game["away"]), table)
         if row is None:
@@ -352,26 +417,41 @@ def ladder_table(entries: list, game: dict, table: pd.DataFrame, tfac: dict, r: 
             continue
         opp = game["away"] if row["team"] == game["home"] else game["home"]
         mu = live_mu(row, lg, tfac.get(opp, 1.0), opp_weight)
+        lines = us.get(int(row["player_id"]))
+        mu_us = market_mu(lines, r) if lines else None
+        us_books = min(b for _, _, b in lines) if lines else 0
+        us_found += mu_us is not None
         book_mean = ladder_implied_mean(prices)
-        gap = mu - book_mean
+        ref_mu = mu_us if mu_us is not None else mu
+        gap = ref_mu - book_mean
         gp = row["gp_cur"] + row["gp_pri"]
         season = (row["shots_cur"] + row["shots_pri"]) / gp if gp else float("nan")
         for k, price in enumerate(prices, start=1):
-            p_m = float(p_over(mu, k - 0.5, r))                      # P(shots >= k)
-            edge = (p_m - 1 / price) * 100
-            light, why = assign_light("Shots on goal", p_m, edge, None, None)
+            p_m = float(p_over(mu, k - 0.5, r))                      # our model: P(shots >= k)
+            p_u = float(p_over(mu_us, k - 0.5, r)) if mu_us is not None else None
+            p_basis = p_u if p_u is not None else p_m                # prefer the market over our own model
+            edge_m = (p_m - 1 / price) * 100
+            edge_u = (p_u - 1 / price) * 100 if p_u is not None else None
+            edge_ref = edge_u if edge_u is not None else edge_m
+            light, why = assign_light("Shots on goal", p_basis, edge_ref, us_books if p_u is not None else None, None)
             if light != "⚪" and abs(gap) >= ROLE_GAP_SHOTS:
                 light = RED
-                why = (f"model expects {mu:.1f} shots but the ladder implies about {book_mean:.1f}: usually a role, "
-                       "line or injury change the model can't see")
+                why = (f"{'the US market' if mu_us is not None else 'the model'} expects {ref_mu:.1f} shots but the "
+                       f"ladder implies about {book_mean:.1f}: either bet365 has priced in a role, line or injury "
+                       "change, or its price is stale. Check the lineup before trusting either")
             recs.append({"Game ID": game["id"], "Game": f"{game['away']} @ {game['home']}", "Player": row["name"],
                          "Player ID": int(row["player_id"]), "Team": row["team"], "Rung": f"{k}+", "k": k,
                          "Odds": price, "Implied %": round(100 / price, 1), "Model %": round(p_m * 100, 1),
-                         "Edge (pp)": round(edge, 1), "EV cash %": round((p_m * price - 1) * 100, 1),
-                         "EV free bet": round(p_m * (price - 1), 3), "Light": light, "Why": why,
-                         "Model mean": round(mu, 2), "Ladder mean (~)": round(book_mean, 2),
-                         "Season shots/gp": round(season, 2)})
-    return pd.DataFrame(recs), {"unmatched": unmatched}
+                         "US market %": round(p_u * 100, 1) if p_u is not None else None,
+                         "Edge vs model (pp)": round(edge_m, 1),
+                         "Edge vs US (pp)": round(edge_u, 1) if edge_u is not None else None,
+                         "Edge (pp)": round(edge_ref, 1), "Basis": "US market" if p_u is not None else "Model",
+                         "US books": us_books if p_u is not None else 0,
+                         "EV cash %": round((p_basis * price - 1) * 100, 1),
+                         "EV free bet": round(p_basis * (price - 1), 3), "Light": light, "Why": why,
+                         "Model mean": round(mu, 2), "US mean (~)": round(mu_us, 2) if mu_us is not None else None,
+                         "Ladder mean (~)": round(book_mean, 2), "Season shots/gp": round(season, 2)})
+    return pd.DataFrame(recs), {"unmatched": unmatched, "us_players": us_found}
 
 
 def settle_ladder(df: pd.DataFrame, fetch_box) -> pd.DataFrame:
@@ -414,7 +494,10 @@ def ladder_summary(settled: pd.DataFrame) -> pd.DataFrame:
     for label, g in [("All rungs", d)] + [(f"{k}+", d[d["k"] == k]) for k in sorted(d["k"].unique())]:
         if g.empty:
             continue
-        rows.append({"Rungs": label, "n": len(g), "Hit %": round((g["Result"] == "won").mean() * 100, 1),
-                     "Model said %": round(g["Model %"].mean(), 1), "Price implied %": round(g["Implied %"].mean(), 1),
-                     "Cash ROI %": round(g["P/L cash (1u)"].sum() / len(g) * 100, 1)})
+        row = {"Rungs": label, "n": len(g), "Hit %": round((g["Result"] == "won").mean() * 100, 1),
+               "Model said %": round(g["Model %"].mean(), 1), "Price implied %": round(g["Implied %"].mean(), 1),
+               "Cash ROI %": round(g["P/L cash (1u)"].sum() / len(g) * 100, 1)}
+        if "US market %" in g and g["US market %"].notna().any():
+            row["US market said %"] = round(g["US market %"].mean(), 1)
+        rows.append(row)
     return pd.DataFrame(rows)

@@ -4,6 +4,7 @@ from common import get_api_key
 from nhl_data import get_completed_games_range
 from nhl_backtest import build_free_results, build_priced_results, pick_games, snapshot_ts
 from odds import fetch_historical_odds, COST_LOG
+from nhl_ui import nhl_today
 from nhl_lights import add_lights, lights_summary, GREEN, AMBER, RED, NONE
 
 st.set_page_config(page_title="NHL Model - Results", layout="centered")
@@ -26,7 +27,7 @@ def cached_snapshot(api_key, ts):
     return events
 
 
-day = st.date_input("Date", value=date.today() - timedelta(days=1), key="res_date")
+day = st.date_input("Date (NHL game date)", value=nhl_today() - timedelta(days=1), key="res_date")
 mode = st.radio("Results mode", ["Model reads only (free)", "Priced-up picks (uses historical odds credits)"],
                 help="Model reads scores every selection the model priced against what happened. Priced-up "
                      "adds the real best odds from a snapshot taken before each game, for true edge and P/L.")

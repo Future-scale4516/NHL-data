@@ -41,6 +41,9 @@ def _parse_time(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+LAST_QUOTA = {}   # filled from the response headers of the most recent live odds call
+
+
 def fetch_odds(api_key: str) -> list[dict]:
     resp = requests.get(
         f"{ODDS_API_BASE}/sports/{SPORT_KEY}/odds",
@@ -48,6 +51,9 @@ def fetch_odds(api_key: str) -> list[dict]:
         timeout=15,
     )
     resp.raise_for_status()
+    LAST_QUOTA.update({k: resp.headers.get(h) for k, h in (("used", "x-requests-used"),
+                                                           ("remaining", "x-requests-remaining"),
+                                                           ("last", "x-requests-last"))})
     return resp.json()
 
 
@@ -203,14 +209,15 @@ def fair_probs(event: dict, line: float = None) -> dict:
 PROP_MARKET_SOG = "player_shots_on_goal"
 
 
-def fetch_event_props(api_key: str, event_id: str, market: str = PROP_MARKET_SOG):
+def fetch_event_props(api_key: str, event_id: str, market: str = PROP_MARKET_SOG, regions: str = "us"):
     """
-    Player props for ONE event (props are only served per event). Costs 1 credit per market per region.
-    Returns (event json, meta). An event with no prop prices comes back with an empty bookmakers list.
+    Player props for ONE event (props are only served per event). The Odds API carries NHL player props from US
+    bookmakers only, so the default region is 'us' (the UK region returns nothing for this market). Costs 1 credit per
+    market per region. Returns (event json, meta). An event with no prop prices comes back with empty bookmakers.
     """
     resp = requests.get(
         f"{ODDS_API_BASE}/sports/{SPORT_KEY}/events/{event_id}/odds",
-        params={"apiKey": api_key, "regions": REGIONS, "markets": market, "oddsFormat": "decimal"},
+        params={"apiKey": api_key, "regions": regions, "markets": market, "oddsFormat": "decimal"},
         timeout=20,
     )
     resp.raise_for_status()

@@ -7,17 +7,20 @@ from nhl_data import get_completed_games_range, get_games, get_boxscore
 from nhl_live import load_slate
 from nhl_goalies import fetch_boxscores
 from nhl_backtest import calibration, season_start_year
+from nhl_ui import nhl_today
 from nhl_lights import GREEN, AMBER, RED, NONE, LIGHT_CONFIG
 from nhl_props import (NB_R, sog_backtest, fetch_stats_table, player_table, team_factors, props_selections,
                        parse_ladder_text, ladder_table, settle_ladder, ladder_summary)
-from odds import fetch_event_props, COST_LOG
+from odds import fetch_event_props, match_event, COST_LOG
 
 st.set_page_config(page_title="NHL Model - Shots on goal", layout="centered")
 st.title("🏒 Shots on goal")
 st.caption("Per player: shots per minute (regressed toward his position's average) x recent ice time x how many shots "
            "the opponent allows, then a negative binomial for P(over a line). The calibration tab checks it against "
            "real box scores for free. It has NOT been compared with historical prices, so treat live edges as "
-           "paper-trade only.")
+           "paper-trade only. **bet365 isn't in the odds feed, and the feed carries NHL player props from US books only "
+           "(DraftKings, FanDuel and others).** Those are used as the market reference: you can't bet them from the UK, "
+           "but they show whether bet365's price is out of line.")
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -110,11 +113,13 @@ with cal_tab:
             st.plotly_chart(fig, width="stretch")
 
 with live_tab:
-    day = st.date_input("Date", value=date.today(), key="sog_day")
+    day = st.date_input("Date (NHL game date)", value=nhl_today(), key="sog_day")
     r_disp = st.number_input("Dispersion r", value=float(bt["r_on"]) if bt else NB_R, min_value=2.0, max_value=200.0,
                              step=1.0, help="Lower = fatter tails. The calibration backtest fits it.")
-    st.caption("Costs about 1 Odds API credit per game that has props (cached for 15 minutes). UK books may carry few "
-               "or no shots-on-goal props: an empty result means none were offered, not that the model failed.")
+    st.caption("These are the **US books'** shots-on-goal lines (the only source the odds provider has), shown as the market "
+               "reference: the best price and consensus are not bettable from the UK. For bet365's own prices use the "
+               "bet365 ladder tab. Costs about 1 Odds API credit per game that has props (cached for 15 minutes). The US "
+               "books usually post them a few hours before the game.")
     if st.button("Load props"):
         api_key = get_api_key()
         if not api_key:
@@ -163,8 +168,8 @@ with live_tab:
             st.caption(f"Odds API: this run used ~{sg['credits']} credits, {sg['remaining']} remaining.")
         sel = sg["sel"]
         if sel.empty:
-            st.info(f"No shots-on-goal prices found for {sg['games']} game(s). UK books often don't offer them through "
-                    "this feed.")
+            st.info(f"No US shots-on-goal prices found for {sg['games']} game(s) yet. The US books usually post them a few "
+                    "hours before the game, so try again closer to the start.")
         else:
             n = sel["Light"].value_counts()
             st.caption(f"{n.get(GREEN, 0)} 🟢 · {n.get(AMBER, 0)} 🟡 · {n.get(RED, 0)} 🔴 · {n.get(NONE, 0)} ⚪ across "
@@ -189,10 +194,12 @@ with live_tab:
                                file_name=f"nhl_sog_{sg['day']}.csv", mime="text/csv")
 
 with ladder_tab:
-    st.caption("bet365 isn't in the odds feed, so type its 'X or more shots' ladder in here. Each rung is priced with the "
-               "model and compared with bet365's price. Log what you check, then settle it against real box scores "
-               "later: that is the only way to find out whether the model beats bet365's actual prices.")
-    ldate = st.date_input("Date", value=date.today(), key="lad_day")
+    st.caption("bet365 isn't in the odds feed, so paste its 'X or more shots' ladder in here (select the rows on bet365, "
+               "copy, paste: the 'last 5' numbers and a name on one line and the prices on the next are all fine). Each "
+               "rung is compared with the **US books' market** for that player when it's available, and with the model "
+               "when it isn't. Log what you check, then settle it against real box scores later: that is the only way to "
+               "find out whether bet365's prices can be beaten.")
+    ldate = st.date_input("Date (NHL game date)", value=nhl_today(), key="lad_day")
     try:
         slate_games = cached_games(str(ldate))
     except Exception as exc:
@@ -203,9 +210,12 @@ with ladder_tab:
     else:
         labels = {f"{g['away']} @ {g['home']}": g for g in slate_games}
         pick = st.selectbox("Game", list(labels))
-        text = st.text_area("Paste or type the ladder (one player per line: name, then the prices for 1+, 2+, 3+ ...)",
+        text = st.text_area("Paste the ladder (or type one player per line: name, then the prices for 1+, 2+, 3+ ...)",
                             height=170, key="lad_text",
                             placeholder="Andrei Svechnikov 1.04 1.25 1.79 3.05 5.50\nOwen Tippett 1.066 1.40 2.30 4.30 8.50")
+        use_us = st.checkbox("Benchmark against the US books' market (about 1 credit)", value=True, key="lad_us",
+                             help="Fetches the US books' shots-on-goal lines for this game and measures bet365's prices "
+                                  "against what they imply for each player. Cached for 15 minutes.")
         ladder_r = st.number_input("Dispersion r", value=float(bt["r_on"]) if bt else NB_R, min_value=2.0,
                                    max_value=200.0, step=1.0, key="lad_r")
         if st.button("Price the ladder"):
@@ -215,8 +225,28 @@ with ladder_tab:
             else:
                 try:
                     table, tfac = load_tables(ldate)
-                    ldf, linfo = ladder_table(entries, labels[pick], table, tfac, r=ladder_r)
-                    st.session_state["lad"] = {"df": ldf, "info": linfo, "bad": bad, "day": str(ldate), "game": pick}
+                    us_event, us_note = None, ""
+                    if use_us:
+                        api_key = get_api_key()
+                        if not api_key:
+                            us_note = "No Odds API key found, so the US benchmark was skipped."
+                        else:
+                            try:
+                                g = labels[pick]
+                                ev = match_event(cached_odds(api_key), g["home"], g["away"], g["start_utc"])
+                                if ev is None:
+                                    us_note = "The odds provider doesn't list this game yet, so there's no US benchmark."
+                                else:
+                                    us_event = cached_props(api_key, ev["id"])
+                                    if not us_event.get("bookmakers"):
+                                        us_note = ("The US books haven't posted shots-on-goal lines for this game yet "
+                                                   "(they usually appear a few hours before). Using the model instead.")
+                                        us_event = None
+                            except Exception as exc:
+                                us_note = f"US benchmark unavailable ({exc}). Using the model instead."
+                    ldf, linfo = ladder_table(entries, labels[pick], table, tfac, r=ladder_r, us_event=us_event)
+                    st.session_state["lad"] = {"df": ldf, "info": linfo, "bad": bad, "day": str(ldate), "game": pick,
+                                               "us_note": us_note, "used_us": us_event is not None}
                 except Exception as exc:
                     st.error(f"Couldn't price the ladder: {exc}")
         lad = st.session_state.get("lad")
@@ -225,24 +255,33 @@ with ladder_tab:
                 st.caption("Skipped lines I couldn't read: " + " | ".join(lad["bad"][:4]))
             if lad["info"]["unmatched"]:
                 st.warning("Couldn't match to a player in this game: " + ", ".join(lad["info"]["unmatched"]))
+            if lad.get("us_note"):
+                st.warning(lad["us_note"])
+            elif lad.get("used_us"):
+                st.caption(f"US benchmark found for {lad['info']['us_players']} of {lad['df']['Player'].nunique()} "
+                           "player(s); the rest use the model.")
             ldf = lad["df"]
             if not ldf.empty:
                 st.markdown("#### Free bet: the best rungs")
                 st.caption("A free bet returns winnings only, so its value is p x (odds - 1) per £1. That favours longer odds "
                            "even at fair prices, so the best free-bet rungs are usually the 3+ to 5+ ones. The model's "
-                           "probability is what separates one long shot from another, and it has not been shown to "
-                           "beat bet365. Avoid any 🔴. A value near or above 1.0 means the model is claiming bet365's price "
-                           "is wrong by a lot, which is far more likely to be the model's error.")
+                           "probability is what separates one long shot from another. Where the US books' lines are "
+                           "available the probability comes from them (a real market); otherwise from our model, which "
+                           "has not been shown to beat bet365. Avoid any 🔴. A value near or above 1.0 means the price "
+                           "looks badly wrong, which is far more likely to be an error on our side or a lineup change.")
                 top = ldf[ldf["Light"] != "🔴"].sort_values("EV free bet", ascending=False).head(5)
-                st.dataframe(top[["Light", "Player", "Rung", "Odds", "Implied %", "Model %", "EV free bet"]],
+                st.dataframe(top[["Light", "Player", "Rung", "Odds", "Implied %", "US market %", "Model %", "EV free bet", "Basis"]],
                              width="stretch", hide_index=True)
                 st.markdown("#### Every rung")
-                st.dataframe(ldf[["Light", "Player", "Rung", "Odds", "Implied %", "Model %", "Edge (pp)", "EV cash %",
-                                  "EV free bet", "Model mean", "Ladder mean (~)", "Season shots/gp"]],
+                st.dataframe(ldf[["Light", "Player", "Rung", "Odds", "Implied %", "US market %", "Model %", "Edge (pp)",
+                                  "Basis", "EV cash %", "EV free bet", "US mean (~)", "Model mean", "Ladder mean (~)",
+                                  "Season shots/gp"]],
                              width="stretch", hide_index=True)
-                st.caption("'Ladder mean' is the shots per game bet365's own prices imply (it reads a little high because "
-                           "the prices include their margin). If it's far from 'Model mean' the model is probably missing "
-                           "a lineup, line or injury change, and the rung goes 🔴. Check the starting lineup first.")
+                st.caption("'Edge' is measured against the US market when available ('Basis'), otherwise against the model. "
+                           "'Ladder mean' is the shots per game bet365's own prices imply (a little high, since prices "
+                           "include their margin). If it's far from the US (or model) mean, either bet365 knows about a "
+                           "lineup, line or injury change or its price is stale, and the rung goes 🔴. Check the starting "
+                           "lineup first.")
                 st.download_button("Download this check (your paper-trading log)", ldf.assign(Date=lad["day"])
                                    .to_csv(index=False).encode("utf-8"), file_name=f"nhl_ladder_{lad['day']}.csv",
                                    mime="text/csv")

@@ -3,3 +3,4 @@ requests
 scipy
 pandas
 plotly
+tzdata
