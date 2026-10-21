@@ -7,6 +7,7 @@ from nhl_bets import pick_bets, build_doubles, settle, pnl, DEFAULT_TRUST, AMBER
 from nhl_lights import GREEN, AMBER, RED, NONE
 from nhl_data import get_scoreboard
 from nhl_ui import nhl_today, uk_time
+from nhl_tracker import save_button
 
 st.set_page_config(page_title="NHL Model - Suggested Bets", layout="centered")
 st.title("🎯 Suggested Bets")
@@ -80,6 +81,8 @@ if sb and sb["day"] == str(day):
                 else:
                     st.dataframe(dbl[["Leg 1", "Leg 2", "Combined odds", "Model prob %", "Units", "Stake"]],
                                  width="stretch", hide_index=True)
+
+            save_button(picks, "suggested", sb["day"], "sb")
 
             st.markdown("#### Live status")
             if st.button("Check live status"):

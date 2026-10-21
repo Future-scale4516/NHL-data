@@ -1,5 +1,6 @@
 import pandas as pd
 import streamlit as st
+from nhl_tracker import save_picker
 from nhl_ui import setup_page, sidebar_date, render_pick_card, sort_picker, uk_time
 from common import get_api_key, cached_odds
 from nhl_live import load_slate, selections, likely_table
@@ -120,6 +121,8 @@ if gb:
         show_market(pl_tab, "Puck line")
         show_market(tot_tab, "Total")
         show_most_likely(likely_tab)
+        if has_odds:
+            save_picker(sel[sel['Light'] != NONE], 'game_bets', gb['date'], 'gb')
         st.caption("Model %: our probability · Fair %: the books' de-vigged consensus (and how many books) · Edge: model "
                    "minus fair · EV %: expected return per unit at the best price. Very large edges usually mean the "
                    "model is missing something about that game, not real value.")

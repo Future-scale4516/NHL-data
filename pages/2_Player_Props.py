@@ -1,5 +1,6 @@
 import pandas as pd
 import streamlit as st
+from nhl_tracker import save_picker
 from nhl_ui import setup_page, sidebar_date, render_pick_card, sort_picker, uk_time
 from common import get_api_key, cached_odds
 from nhl_data import get_games, fetch_player_game_log
@@ -175,6 +176,7 @@ if edges:
 
         (sog_tab,) = st.tabs(["🏒 Shots on goal"])
         show_prop_market(sog_tab, "Shots on goal")
+        save_picker(view[view["Market"] == "Shots on goal"], "props", sel_date, "pp")
         st.caption(f"{GREEN} edge 4–8 pts over the market · {AMBER} above that, or only one book to check against. "
                    f"{RED} (12+) and no-signal (<4) are hidden unless you tick the box above. Model %: our probability · "
                    "Market %: the US books' de-vigged consensus · Best US price: best decimal price across US books. "
